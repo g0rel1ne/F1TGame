@@ -57,7 +57,7 @@ Open **http://localhost:5173/** in your browser.
 ### Step 4. In the game
 
 1. Click **Play offline**.
-2. Click **Create lobby**.
+2. Click **Create career**.
 3. Fill in the team wizard (name, colours, engine, philosophy) and create your team.
 4. You are now on the dashboard. Progress is saved automatically in this browser.
 
@@ -71,6 +71,10 @@ That is solo mode. No Supabase, no accounts, no internet required after install.
 - Offline solo careers are stored in one browser profile only. Two different
   browsers (or a browser and an incognito window) cannot share one — use online
   multiplayer for that.
+- Invitation codes work between **tabs of the same browser** (they share the
+  local database), but never across devices. "No lobby found with that
+  invitation code" in offline mode means the code was made in a different
+  browser or device.
 
 ---
 

@@ -172,7 +172,7 @@ export function AuthPage() {
 
             <p className="mt-4 text-center text-[11px] leading-relaxed text-gray-500">
               {mode === "local"
-                ? "Dev mode: accounts are stored locally in this browser's IndexedDB. Open a second browser profile to test multiplayer."
+                ? "Offline mode: accounts and careers are stored in this browser only, so an invitation code works for a second tab in this same browser but not on another device. Other devices need the online (Supabase) setup."
                 : "Accounts are secured by Supabase Auth. Never share your password."}
             </p>
           </form>

@@ -188,7 +188,13 @@ export class LocalBackend implements Backend {
   async joinLobby(userId: string, username: string, inviteCode: string): Promise<Lobby> {
     const lobbies = await idbAll<Lobby>("lobbies");
     const lobby = lobbies.find((l) => l.inviteCode.toUpperCase() === inviteCode.toUpperCase());
-    if (!lobby) throw new Error("No lobby found with that invitation code.");
+    if (!lobby) {
+      throw new Error(
+        lobbies.length === 0
+          ? "No careers exist in this browser yet. In offline mode careers are stored per browser - open a second tab in this same browser to join, or set up Supabase to play across devices."
+          : "No lobby found with that invitation code. In offline mode codes only work for careers created in this same browser.",
+      );
+    }
     if (lobby.members.some((m) => m.userId === userId)) return lobby;
     if (lobby.members.length >= lobby.settings.maxPlayers) throw new Error("This lobby is full.");
     if (lobby.settings.requireApproval) throw new Error("This lobby requires host approval to join.");

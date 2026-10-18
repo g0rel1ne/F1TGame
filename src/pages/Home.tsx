@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { CalendarDays, Copy, Flag, LogOut, Plus, RefreshCw, Users } from "lucide-react";
+import { CalendarDays, Copy, Flag, LogOut, Plus, RefreshCw, Users, WifiOff } from "lucide-react";
 import { useSession } from "../state/session";
 import { Badge, Empty, Modal, SectionHeading, Spinner } from "../components/ui";
 import { DEFAULT_LOBBY_SETTINGS } from "../backend/types";
@@ -77,6 +77,16 @@ export function HomePage() {
           </button>
         </div>
       </header>
+
+      {backend.mode === "local" && (
+        <div className="mb-6 flex items-start gap-3 rounded-lg border border-carbon-600 bg-carbon-900/60 px-4 py-3 text-xs text-gray-400">
+          <WifiOff size={15} className="mt-0.5 shrink-0 text-race-teal" />
+          <p>
+            <span className="font-semibold text-gray-200">Offline mode.</span> Careers are stored in this browser only, so an invitation code works
+            for another tab in this same browser but never for another device. Set up Supabase for real online multiplayer.
+          </p>
+        </div>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
         <div className="space-y-6">
