@@ -1,0 +1,52 @@
+# Supabase CLI configuration for F1 Team Principal Online.
+# Docs: https://supabase.com/docs/guides/local-development/cli/config
+
+project_id = "f1-team-principal"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+major_version = 15
+
+[studio]
+enabled = true
+port = 54323
+
+[realtime]
+enabled = true
+
+[auth]
+enabled = true
+site_url = "http://localhost:5173"
+additional_redirect_urls = ["http://localhost:5173", "https://*.github.io"]
+jwt_expiry = 3600
+enable_signup = true
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = false
+enable_confirmations = false
+
+[functions.apply-action]
+verify_jwt = true
+
+[functions.start-race]
+verify_jwt = true
+
+[functions.set-ready]
+verify_jwt = true
+
+[functions.negotiate]
+verify_jwt = true
+
+[functions.transfer-host]
+verify_jwt = true
+
+[functions.remove-member]
+verify_jwt = true

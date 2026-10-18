@@ -1,0 +1,82 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(1200px 600px at 80% -10%, #16202e 0%, #0b0d12 55%, #08090c 100%);
+  color: #e6e9ef;
+  font-family: "Rajdhani", "Segoe UI", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-xl border border-carbon-700 bg-carbon-850/80 shadow-panel backdrop-blur transition-colors duration-200;
+  }
+  .panel-pad {
+    @apply p-4 sm:p-5;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-3.5 py-2 text-sm font-semibold tracking-wide transition-colors disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .btn-primary {
+    @apply btn bg-race-red text-white hover:bg-red-600;
+  }
+  .btn-ghost {
+    @apply btn border border-carbon-600 bg-carbon-800 text-gray-200 hover:bg-carbon-700;
+  }
+  .btn-subtle {
+    @apply btn text-gray-300 hover:bg-carbon-800;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border border-carbon-600 bg-carbon-800 px-2.5 py-0.5 text-xs font-medium text-gray-300;
+  }
+  .label {
+    @apply text-[11px] font-semibold uppercase tracking-[0.14em] text-gray-400;
+  }
+  .input {
+    @apply w-full rounded-lg border border-carbon-600 bg-carbon-900 px-3 py-2 text-sm text-gray-100 outline-none placeholder:text-gray-500 focus:border-race-teal;
+  }
+  .table-row {
+    @apply border-b border-carbon-700/70 hover:bg-carbon-800/60;
+  }
+  .stat-value {
+    @apply font-mono text-2xl font-semibold text-white;
+  }
+  .heading {
+    @apply font-display text-xl font-bold uppercase tracking-wide text-white;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: #0d0f14;
+}
+::-webkit-scrollbar-thumb {
+  background: #2b323f;
+  border-radius: 6px;
+}

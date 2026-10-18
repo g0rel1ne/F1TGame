@@ -1,0 +1,16 @@
+node_modules
+dist
+dist-ssr
+*.local
+.env
+.env.*
+!.env.example
+coverage
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+*.log
+supabase/.branches
+supabase/.temp
+supabase/functions/_shared/engine
+supabase/functions/_shared/data
