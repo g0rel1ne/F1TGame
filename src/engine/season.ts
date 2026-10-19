@@ -18,6 +18,7 @@ import type {
   StaffMember,
   TeamSpec,
   Transaction,
+  TransferOffer,
   UpgradeProject,
   WeatherState,
 } from "./types";
@@ -37,7 +38,7 @@ import { defaultStrategy, makeStrategyPlan } from "./strategy";
 import { constructorsPrize, makeTxn } from "./finance";
 import { repairCost } from "./damage";
 import { tickProject, installUpgrade, facilityLevel, developmentModifiers, emptyInstalled } from "./development";
-import { aiDriverMarket } from "./drivermarket";
+import { aiDriverMarket, aiWillingToPay, expectedSalary } from "./drivermarket";
 import { convergeSetup, type Setup } from "./car";
 
 /** Config for whether the real-world AI driver names are used. */
@@ -70,6 +71,8 @@ export interface CareerBundle {
   cars: CarSpec[];
   drivers: Driver[];
   driverContracts: DriverContract[];
+  /** Incoming approaches from AI teams for contracted drivers. */
+  transferOffers: TransferOffer[];
   staff: StaffMember[];
   staffMarket: StaffMember[];
   facilities: Facility[];
@@ -219,6 +222,7 @@ export function createCareerBundle(params: {
     cars,
     drivers,
     driverContracts,
+    transferOffers: [],
     staff,
     staffMarket: buildStaffMarket(params.careerId, 24),
     facilities,
@@ -481,6 +485,231 @@ export function releaseDriver(bundle: CareerBundle, driverId: string): CareerBun
     driverContracts: bundle.driverContracts.map((c) => (c.driverId === driverId ? { ...c, active: false } : c)),
     finances: contract ? bundle.finances.map((f) => (f.teamId === contract.teamId ? { ...f, balance: f.balance - termination } : f)) : bundle.finances,
     transactions: txn ? [...bundle.transactions, txn] : bundle.transactions,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Mid-season transfer market
+// ---------------------------------------------------------------------------
+
+function driverRating(d: Driver): number {
+  return d.attributes.pace * 0.5 + d.attributes.qualifying * 0.2 + d.attributes.racecraft * 0.3;
+}
+
+function fmtMoney(n: number): string {
+  if (Math.abs(n) >= 1_000_000) return `$${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}m`;
+  if (Math.abs(n) >= 1_000) return `$${Math.round(n / 1_000)}k`;
+  return `$${Math.round(n)}`;
+}
+
+export function transferFeeFor(driver: Driver): number {
+  const rating = driverRating(driver);
+  const base = Math.max(2_000_000, driver.salaryDemand * 1.6);
+  return Math.round((base * (0.6 + (rating - 60) / 60)) / 100_000) * 100_000;
+}
+
+function contractFor(bundle: CareerBundle, driverId: string, teamId: string, salary: number, years: number): DriverContract {
+  return {
+    id: `dc-${driverId}-${teamId}-${bundle.season.number}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    careerId: bundle.career.id,
+    driverId,
+    teamId,
+    season: bundle.season.number,
+    salary,
+    signingBonus: 0,
+    winBonus: 0,
+    podiumBonus: 0,
+    championshipBonus: 0,
+    years,
+    performanceClausePosition: null,
+    active: true,
+  };
+}
+
+/**
+ * Runs one mid-season AI transfer round: AI teams may release a driver to chase
+ * a stronger free agent, fill empty seats, and table offers for drivers on a
+ * player-run team. Nothing moves for free agents signed here beyond the seat
+ * change; player-team drivers only move when the offer is accepted.
+ */
+export function runAiTransferWindow(bundle: CareerBundle): CareerBundle {
+  const season = bundle.season;
+  const rng = new Rng(`transfers:${bundle.career.id}:${season.number}:${season.currentRaceIndex}:${bundle.drivers.length}`);
+  const news: NewsItem[] = [];
+  const financials = bundle.finances.map((f) => ({ ...f }));
+  const transactions = [...bundle.transactions];
+  let drivers = [...bundle.drivers];
+  let driverContracts = [...bundle.driverContracts];
+  const transferOffers = [...(bundle.transferOffers ?? [])];
+
+  const aiTeams = bundle.teams.filter((t) => !t.isPlayerTeam);
+  const playerTeams = bundle.teams.filter((t) => t.isPlayerTeam);
+  const seatCount = (teamId: string) => drivers.filter((d) => d.teamId === teamId).length;
+
+  for (const team of aiTeams) {
+    const mine = drivers.filter((d) => d.teamId === team.id);
+    if (mine.length < 2 || !rng.chance(0.12)) continue;
+    const weakest = [...mine].sort((a, b) => driverRating(a) - driverRating(b))[0];
+    const bestFree = drivers.filter((d) => d.teamId === null).sort((a, b) => driverRating(b) - driverRating(a))[0];
+    if (!bestFree || driverRating(bestFree) - driverRating(weakest) < 3) continue;
+    drivers = drivers.map((d) => (d.id === weakest.id ? { ...d, teamId: null, morale: clamp(d.morale - 6, 0, 100) } : d));
+    driverContracts = driverContracts.map((c) => (c.driverId === weakest.id && c.active ? { ...c, active: false } : c));
+    news.push(makeNews(bundle, "contract", `${weakest.name} released`, `${team.name} have parted ways with ${weakest.name} ahead of the next round.`, season.currentRaceIndex, season.number));
+  }
+
+  for (const team of aiTeams) {
+    if (!rng.chance(0.08)) continue;
+    const balance = financials.find((f) => f.teamId === team.id)?.balance ?? 0;
+    const weakest = [...drivers.filter((d) => d.teamId === team.id)].sort((a, b) => driverRating(a) - driverRating(b))[0];
+    if (!weakest) continue;
+    const rival = drivers
+      .filter((d) => d.teamId && !playerTeams.some((pt) => pt.id === d.teamId) && d.teamId !== team.id)
+      .filter((d) => driverRating(d) - driverRating(weakest) >= 6)
+      .sort((a, b) => driverRating(b) - driverRating(a))[0];
+    if (!rival) continue;
+    const fee = transferFeeFor(rival);
+    if (fee > Math.max(6_000_000, balance * 0.4)) continue;
+    const sellerId = rival.teamId!;
+    drivers = drivers.map((d) => (d.id === weakest.id ? { ...d, teamId: null, morale: clamp(d.morale - 6, 0, 100) } : d));
+    driverContracts = driverContracts.map((c) => (c.driverId === weakest.id && c.active ? { ...c, active: false } : c));
+    const salary = Math.round(expectedSalary(rival, team.reputation) * rng.range(1.05, 1.3));
+    drivers = drivers.map((d) => (d.id === rival.id ? { ...d, teamId: team.id } : d));
+    driverContracts = driverContracts.map((c) => (c.driverId === rival.id && c.active ? { ...c, active: false } : c));
+    driverContracts.push(contractFor(bundle, rival.id, team.id, salary, rng.int(2, 3)));
+    financials.forEach((f) => {
+      if (f.teamId === team.id) f.balance -= fee;
+      if (f.teamId === sellerId) f.balance += fee;
+    });
+    transactions.push(
+      makeTxn({ careerId: bundle.career.id, season: season.number, raceIndex: season.currentRaceIndex, teamId: team.id }, "transfer", -fee, `Transfer fee: ${rival.name}`),
+      makeTxn({ careerId: bundle.career.id, season: season.number, raceIndex: season.currentRaceIndex, teamId: sellerId }, "transfer", fee, `Transfer received: ${rival.name}`),
+    );
+    news.push(
+      makeNews(bundle, "contract", `${rival.name} joins ${team.shortName}`, `${team.name} have poached ${rival.name} for ${fmtMoney(fee)}.`, season.currentRaceIndex, season.number),
+    );
+  }
+
+  for (const team of aiTeams) {
+    const budgetCap = aiWillingToPay(team, team.aiProfile);
+    let guard = 0;
+    while (seatCount(team.id) < 2 && guard < 3) {
+      guard++;
+      const pool = drivers.filter((d) => d.teamId === null).sort((a, b) => driverRating(b) - driverRating(a));
+      if (pool.length === 0) break;
+      const affordable = pool.filter((d) => expectedSalary(d, team.reputation) <= budgetCap);
+      const choice = affordable[0] ?? pool[0];
+      const salary = Math.round(expectedSalary(choice, team.reputation) * rng.range(1, 1.25));
+      drivers = drivers.map((d) => (d.id === choice.id ? { ...d, teamId: team.id } : d));
+      driverContracts.push(contractFor(bundle, choice.id, team.id, salary, rng.int(1, 3)));
+      news.push(
+        makeNews(bundle, "contract", `${team.shortName} sign ${choice.name}`, `${team.name} have signed ${choice.name} on a ${fmtMoney(salary)}-per-season deal.`, season.currentRaceIndex, season.number),
+      );
+    }
+  }
+
+  for (const team of aiTeams) {
+    if (!rng.chance(0.1)) continue;
+    const balance = financials.find((f) => f.teamId === team.id)?.balance ?? 0;
+    const targets = drivers
+      .filter((d) => d.teamId && playerTeams.some((pt) => pt.id === d.teamId))
+      .filter((d) => !transferOffers.some((o) => o.driverId === d.id && o.status === "open"))
+      .sort((a, b) => driverRating(b) - driverRating(a));
+    if (targets.length === 0) continue;
+    const target = targets[0];
+    const fee = transferFeeFor(target);
+    if (fee > Math.max(4_000_000, balance * 0.5)) continue;
+    const salary = Math.round(expectedSalary(target, team.reputation) * rng.range(1.05, 1.35));
+    transferOffers.push({
+      id: `to-${target.id}-${team.id}-s${season.number}-r${season.currentRaceIndex}-${transferOffers.length}`,
+      careerId: bundle.career.id,
+      season: season.number,
+      raceIndex: season.currentRaceIndex,
+      driverId: target.id,
+      fromTeamId: team.id,
+      fee,
+      salary,
+      years: rng.int(2, 3),
+      status: "open",
+      createdAt: Date.now(),
+    });
+    news.push(
+      makeNews(bundle, "contract", `${team.shortName} bid for ${target.name}`, `${team.name} have approached ${target.name} with a ${fmtMoney(fee)} offer. A decision is required.`, season.currentRaceIndex, season.number),
+    );
+  }
+
+  return {
+    ...bundle,
+    drivers,
+    driverContracts,
+    transferOffers,
+    finances: financials,
+    transactions,
+    news: [...bundle.news, ...news],
+  };
+}
+
+export function respondTransferOffer(bundle: CareerBundle, offerId: string, accept: boolean): CareerBundle {
+  const offers = bundle.transferOffers ?? [];
+  const offer = offers.find((o) => o.id === offerId && o.status === "open");
+  if (!offer) return bundle;
+  const season = bundle.season;
+
+  if (!accept) {
+    return {
+      ...bundle,
+      transferOffers: offers.map((o) => (o.id === offerId ? { ...o, status: "rejected" } : o)),
+      news: [
+        ...bundle.news,
+        makeNews(bundle, "contract", `${bundle.drivers.find((d) => d.id === offer.driverId)?.name ?? "Driver"} stays`, `You turned down ${bundle.teams.find((t) => t.id === offer.fromTeamId)?.name ?? "the approach"}. The driver remains under contract.`, season.currentRaceIndex, season.number),
+      ],
+    };
+  }
+
+  const driver = bundle.drivers.find((d) => d.id === offer.driverId);
+  const toTeam = bundle.teams.find((t) => t.id === offer.fromTeamId);
+  const fromTeamId = driver?.teamId ?? null;
+  if (!driver || !toTeam || !fromTeamId) return bundle;
+
+  let drivers = [...bundle.drivers];
+  let driverContracts = bundle.driverContracts.map((c) => (c.active ? { ...c } : c));
+
+  let releasedName: string | null = null;
+  const buyer = drivers.filter((d) => d.teamId === toTeam.id);
+  if (buyer.length >= 2) {
+    const weakest = [...buyer].sort((a, b) => driverRating(a) - driverRating(b))[0];
+    releasedName = weakest.name;
+    drivers = drivers.map((d) => (d.id === weakest.id ? { ...d, teamId: null, morale: clamp(d.morale - 6, 0, 100) } : d));
+    driverContracts = driverContracts.map((c) => (c.driverId === weakest.id && c.active ? { ...c, active: false } : c));
+  }
+
+  drivers = drivers.map((d) => (d.id === driver.id ? { ...d, teamId: toTeam.id } : d));
+  driverContracts = driverContracts.map((c) => (c.driverId === driver.id && c.active ? { ...c, active: false } : c));
+  driverContracts.push(contractFor(bundle, driver.id, toTeam.id, offer.salary, offer.years));
+
+  const finances = bundle.finances.map((f) => {
+    if (f.teamId === toTeam.id) return { ...f, balance: f.balance - offer.fee };
+    if (f.teamId === fromTeamId) return { ...f, balance: f.balance + offer.fee };
+    return f;
+  });
+  const ctx = { careerId: bundle.career.id, season: season.number, raceIndex: season.currentRaceIndex };
+  const transactions = [
+    ...bundle.transactions,
+    makeTxn({ ...ctx, teamId: toTeam.id }, "transfer", -offer.fee, `Transfer fee: ${driver.name}`),
+    makeTxn({ ...ctx, teamId: fromTeamId }, "transfer", offer.fee, `Transfer received: ${driver.name}`),
+  ];
+
+  const news: NewsItem[] = [
+    makeNews(bundle, "contract", `${driver.name} joins ${toTeam.shortName}`, `${toTeam.name} have completed the ${fmtMoney(offer.fee)} signing of ${driver.name}.${releasedName ? ` ${releasedName} leaves to make room.` : ""}`, season.currentRaceIndex, season.number),
+  ];
+
+  return {
+    ...bundle,
+    drivers,
+    driverContracts,
+    finances,
+    transactions,
+    transferOffers: offers.map((o) => (o.id === offerId ? { ...o, status: "accepted" } : o)),
+    news: [...bundle.news, ...news],
   };
 }
 
@@ -863,7 +1092,7 @@ export function advanceCalendar(bundle: CareerBundle): CareerBundle {
   const nextCircuit = season.calendar[nextIndex];
   const rng = new Rng(`weekend:${bundle.career.id}:${season.number}:${nextIndex}`);
   const updatedSeason = { ...season, currentRaceIndex: nextIndex };
-  return {
+  return runAiTransferWindow({
     ...bundle,
     season: updatedSeason,
     seasons: bundle.seasons.map((s) => (s.number === season.number ? updatedSeason : s)),
@@ -877,7 +1106,7 @@ export function advanceCalendar(bundle: CareerBundle): CareerBundle {
       resultId: null,
       startedAt: null,
     },
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,6 +1262,7 @@ export function startNextSeason(bundle: CareerBundle, sameRuleset = true): Caree
     seasons: [...bundle.seasons, season],
     drivers: driversAfter,
     driverContracts: [...driverContracts, ...newContracts],
+    transferOffers: (bundle.transferOffers ?? []).filter((o) => o.status !== "open"),
     weekend: {
       season: newNumber,
       raceIndex: 0,

@@ -177,7 +177,23 @@ export interface DriverContract {
   active: boolean;
 }
 
-/** Cosmetic bodywork shapes selectable in the Garage. */
+export interface TransferOffer {
+  id: string;
+  careerId: string;
+  season: number;
+  raceIndex: number;
+  /** The driver being bid for (currently on the receiving club's books). */
+  driverId: string;
+  /** The AI team making the approach. */
+  fromTeamId: string;
+  /** Compensation paid to the driver's current team. */
+  fee: number;
+  /** Salary per season offered to the driver. */
+  salary: number;
+  years: number;
+  status: "open" | "accepted" | "rejected";
+  createdAt: number;
+}
 export type FrontWingStyle = "swept" | "straight" | "multi";
 export type RearWingStyle = "swept" | "box" | "biplane";
 export type SidepodStyle = "tapered" | "wide" | "tunnel";
@@ -398,6 +414,7 @@ export interface Transaction {
     | "repairs"
     | "travel"
     | "termination"
+    | "transfer"
     | "investment"
     | "starting-capital";
   amount: number; // negative == expense

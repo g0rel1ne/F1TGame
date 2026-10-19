@@ -5,6 +5,19 @@ import type {
 import type { ChatMessage, Lobby, LobbySettings, RaceResult, UpgradeArea } from "../engine/types";
 import type { Setup } from "../engine/car";
 import type { ContractOffer } from "../engine/drivermarket";
+import type { LiveMessage } from "../engine/liveSession";
+
+/**
+ * A best-effort pub/sub channel used by the live race. In offline mode it is a
+ * `BroadcastChannel` between tabs of the same browser; online it is a Supabase
+ * Realtime broadcast channel scoped to the lobby.
+ */
+export interface LiveTransport {
+  send(message: LiveMessage): void;
+  /** Register a listener. Returns an unsubscribe function. */
+  listen(handler: (message: LiveMessage, fromUserId: string) => void): () => void;
+  close(): void;
+}
 
 export interface AuthUser {
   id: string;
@@ -49,6 +62,7 @@ export type CareerAction =
       performanceClausePosition: number | null;
     }
   | { type: "release-driver"; driverId: string }
+  | { type: "respond-transfer-offer"; offerId: string; accept: boolean }
   | { type: "start-project"; teamId: string; area: UpgradeArea }
   | { type: "install-project"; teamId: string; projectId: string }
   | { type: "upgrade-facility"; teamId: string; kind: import("../engine/types").FacilityKind }
@@ -92,8 +106,15 @@ export interface Backend {
   applyAction(lobbyId: string, userId: string, action: CareerAction): Promise<{ bundle: CareerBundle; extra: CareerActionExtra }>;
   negotiate(lobbyId: string, userId: string, driverId: string, teamId: string, offer: ContractOffer): Promise<import("../engine/drivermarket").NegotiationResult>;
   startRace(lobbyId: string, userId: string): Promise<{ bundle: CareerBundle; result: RaceResult }>;
-  /** Commit a result produced by the interactive live race (offline mode). Host only. */
+  /** Commit a result produced by the interactive live race. Host only. */
   commitRace(lobbyId: string, userId: string, result: RaceResult): Promise<{ bundle: CareerBundle; result: RaceResult }>;
+
+  /**
+   * Open a live-race channel for this lobby. Messages published here are not
+   * persisted and are not authenticated beyond the channel scope, so callers
+   * must validate the `fromUserId` of anything they act on.
+   */
+  openLive(lobbyId: string, userId: string): LiveTransport;
 
   /** Subscribe to lobby/career changes. Returns an unsubscribe function. */
   subscribeLobby(lobbyId: string, onChange: () => void): () => void;

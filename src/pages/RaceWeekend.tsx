@@ -8,10 +8,11 @@ import { useSession } from "../state/session";
 import { Badge, Empty, Panel, SectionHeading, Spinner, Stat } from "../components/ui";
 import { TeamBadge } from "../components/LiveryEditor";
 import { TrackMap, type TrackMarker } from "../components/TrackMap";
-import { LiveRaceView } from "../components/LiveRace";
+import { LiveRaceView, type LiveRaceOnline } from "../components/LiveRace";
 import { getCircuit } from "../data/circuits";
 import { deriveAxes, hasDetailedSetup, setupPenalty, type Setup } from "../engine/car";
 import type { LapRecord, RaceIncident, RaceResult, WeatherState } from "../engine/types";
+import type { LiveTransport } from "../backend/types";
 import { balanceOf, findTeam } from "../lib/career";
 import { lapTime, money } from "../lib/format";
 
@@ -40,10 +41,58 @@ function setupSummary(setup: Setup): Array<[string, string]> {
 }
 
 export function RaceWeekendPage() {
-  const { bundle, user, lobby, myTeamId, isHost, mode, applyAction, startRace, commitRace, setReady, pushToast, refresh } = useSession();
+  const { bundle, user, lobby, myTeamId, isHost, mode, backend, applyAction, startRace, commitRace, setReady, pushToast, refresh } = useSession();
   const [busy, setBusy] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const [live, setLive] = useState(false);
+
+  // One live-race channel per open lobby. The host streams the race on it; the
+  // guests listen for the start and then render the host's beats. It is created
+  // inside the effect (rather than memoised) so a remount always gets a fresh,
+  // open channel — StrictMode's double-invoke would otherwise close a shared one.
+  const lobbyId = lobby?.id ?? null;
+  const userId = user?.id ?? null;
+  const [liveTransport, setLiveTransport] = useState<LiveTransport | null>(null);
+  useEffect(() => {
+    if (!lobbyId || !userId) return;
+    const transport = backend.openLive(lobbyId, userId);
+    setLiveTransport(transport);
+    return () => {
+      setLiveTransport(null);
+      transport.close();
+    };
+  }, [backend, lobbyId, userId]);
+
+  // Keep the wire props stable: a fresh object here would re-subscribe every render.
+  const peers = useMemo(
+    () => (lobby?.members ?? []).map((m) => ({ userId: m.userId, teamId: m.teamId, online: m.online })),
+    [lobby?.members],
+  );
+  const liveOnline = useMemo<LiveRaceOnline | null>(
+    () => (liveTransport && userId ? { transport: liveTransport, userId, isHost, peers } : null),
+    [liveTransport, userId, isHost, peers],
+  );
+  const syncPendingRef = useRef(false);
+  useEffect(() => {
+    if (!liveTransport || isHost) return;
+    // Ask the host for the current state: if a live race is already running
+    // (page opened mid-race) that answer is what opens the live view. After the
+    // guest leaves, later beats are ignored rather than reopening it.
+    syncPendingRef.current = true;
+    liveTransport.send({ t: "sync" });
+    return liveTransport.listen((message) => {
+      if (message.t === "start") {
+        syncPendingRef.current = false;
+        setLive(true);
+        pushToast("info", "The host has started the live race.");
+      } else if (message.t === "beat" && syncPendingRef.current) {
+        syncPendingRef.current = false;
+        setLive(true);
+      } else if (message.t === "abort") {
+        setLive(false);
+      }
+    });
+  }, [liveTransport, isHost, pushToast]);
 
   if (!bundle || !user || !lobby) return null;
   const circuit = getCircuit(bundle.weekend.circuitId);
@@ -58,7 +107,7 @@ export function RaceWeekendPage() {
   const practiceResults = bundle.practice.slice(-6).reverse();
   const myDrivers = bundle.drivers.filter((d) => d.teamId === myTeamId);
   const balance = myTeamId ? balanceOf(bundle, myTeamId) : 0;
-  const canGoLive = mode === "local" && isHost;
+  const canGoLive = isHost;
   const showLive = live && !result;
 
   const act = async (key: string, fn: () => Promise<unknown>, ok: string) => {
@@ -111,6 +160,7 @@ export function RaceWeekendPage() {
         <LiveRaceView
           bundle={bundle}
           myTeamId={myTeamId}
+          online={liveOnline}
           onAbort={() => setLive(false)}
           onFinish={async (res) => {
             await commitRace(res);
@@ -262,17 +312,15 @@ export function RaceWeekendPage() {
                   </button>
                   {isHost ? (
                     <>
-                      {canGoLive && (
-                        <button className="btn-primary" onClick={() => setLive(true)} disabled={!myTeamId || readyCount < online.length}>
-                          <Radio size={15} /> Go live
-                        </button>
-                      )}
-                      <button className={canGoLive ? "btn-ghost" : "btn-primary"} onClick={() => void runStart()} disabled={starting || readyCount < online.length || !myTeamId}>
-                        {starting ? <Spinner label="Simulating…" /> : <><Flag size={15} /> {canGoLive ? "Quick sim" : "Start race"}</>}
+                      <button className="btn-primary" onClick={() => setLive(true)} disabled={!myTeamId || readyCount < online.length}>
+                        <Radio size={15} /> Go live
+                      </button>
+                      <button className="btn-ghost" onClick={() => void runStart()} disabled={starting || readyCount < online.length || !myTeamId}>
+                        {starting ? <Spinner label="Simulating…" /> : <><Flag size={15} /> Quick sim</>}
                       </button>
                     </>
                   ) : (
-                    <span className="text-xs text-gray-500">Only the host can start the race once everyone is ready.</span>
+                    <span className="text-xs text-gray-500">Only the host can start the race once everyone is ready — if they go live, this screen switches to the shared race automatically.</span>
                   )}
                   {isHost && readyCount < online.length && <span className="text-xs text-amber-400">All online principals must be ready.</span>}
                 </div>
@@ -324,7 +372,11 @@ export function RaceWeekendPage() {
 
           <div className="panel panel-pad text-xs text-gray-500">
             <div className="label mb-1">Simulation note</div>
-            Go live to run the race in real time: radio your drivers to push, save tyres or box for fresh rubber, and watch it play out on the map. Or use Quick sim for an instant deterministic result. Recorded results are processed exactly once to protect points and finances.
+            Go live to run the race in real time: radio your drivers to push, save tyres or box for fresh rubber, and watch it play out on the map.
+            {mode === "supabase"
+              ? " Every principal in the lobby joins the same race, commands only their own cars, and can vote to change the pace or skip ahead — the host records the initial result, which the server re-scores against the championship."
+              : " Offline, every tab of this browser watching the same lobby joins the race."}{" "}
+            Or use {canGoLive ? "Quick sim" : "Start race"} for an instant deterministic result. Recorded results are processed exactly once to protect points and finances.
           </div>
         </div>
       </div>

@@ -67,7 +67,11 @@ export interface LiveCarView {
   gapAhead: number | null;
   lastLapTime: number | null;
   bestLapTime: number | null;
+  /** True on the lap the stop is actually made. */
   pit: boolean;
+  /** True once the pit wall has been told to box at the end of this lap. */
+  pitRequest: boolean;
+  pitCompound: Compound | null;
   retired: boolean;
   pits: number;
   pace: Pace;
@@ -428,6 +432,8 @@ export class LiveRace {
       lastLapTime: c.lastLapTime,
       bestLapTime: c.bestLapTime,
       pit: c.pitThisLap,
+      pitRequest: c.command.pitRequest,
+      pitCompound: c.command.pitCompound,
       retired: c.retired,
       pits: c.pitsMade,
       pace: c.command.pace,

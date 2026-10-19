@@ -29,6 +29,19 @@ export function DriversPage() {
   const [sort, setSort] = useState<SortKey>("pace");
   const [target, setTarget] = useState<Driver | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [busyOffer, setBusyOffer] = useState<string | null>(null);
+
+  const respond = async (offerId: string, accept: boolean) => {
+    setBusyOffer(offerId);
+    try {
+      await applyAction({ type: "respond-transfer-offer", offerId, accept });
+      pushToast("success", accept ? "Transfer accepted" : "Offer rejected");
+    } catch (e) {
+      pushToast("error", (e as Error).message);
+    } finally {
+      setBusyOffer(null);
+    }
+  };
 
   if (!bundle || !myTeamId) return null;
   const team = findTeam(bundle, myTeamId);
@@ -36,6 +49,7 @@ export function DriversPage() {
 
   const roster = teamDrivers(bundle, myTeamId);
   const balance = balanceOf(bundle, myTeamId);
+  const incoming = (bundle.transferOffers ?? []).filter((o) => o.status === "open" && roster.some((d) => d.id === o.driverId));
 
   const freeAgents = useMemo(() => {
     const list = bundle.drivers.filter((d) => d.teamId === null);
@@ -115,6 +129,48 @@ export function DriversPage() {
             <div className="mt-3 rounded bg-carbon-900/60 p-2 text-[11px] text-gray-500">
               Budget available: <span className="font-mono text-gray-300">{money(balance, { compact: true })}</span>. Signing bonuses are paid immediately; salaries are paid per race across the season.
             </div>
+          </Panel>
+
+          <Panel title="Incoming offers" right={<Badge tone={incoming.length ? "warn" : "default"}>{incoming.length}</Badge>}>
+            {incoming.length === 0 ? (
+              <p className="text-xs text-gray-500">
+                No bids right now. Rival teams scout the grid through the season — offers for your drivers appear here when they come in.
+              </p>
+            ) : (
+              <div className="space-y-3">
+                {incoming.map((o) => {
+                  const driver = bundle.drivers.find((d) => d.id === o.driverId);
+                  const bidder = findTeam(bundle, o.fromTeamId);
+                  if (!driver || !bidder) return null;
+                  return (
+                    <div key={o.id} className="rounded-lg border border-amber-800/60 bg-amber-950/20 p-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <TeamBadge team={bidder} size={30} />
+                          <div>
+                            <div className="text-sm font-semibold text-white">{bidder.name} want {driver.name}</div>
+                            <div className="text-[11px] text-gray-500">Offer expires at season's end</div>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-gray-400">
+                        <span className="chip">Fee {money(o.fee, { compact: true })}</span>
+                        <span className="chip">Salary {money(o.salary, { compact: true })}/y</span>
+                        <span className="chip">{o.years} years</span>
+                      </div>
+                      <div className="mt-3 flex gap-2">
+                        <button className="btn-primary px-3 py-1 text-xs" disabled={busyOffer === o.id} onClick={() => void respond(o.id, true)}>
+                          Accept transfer
+                        </button>
+                        <button className="btn-ghost px-3 py-1 text-xs" disabled={busyOffer === o.id} onClick={() => void respond(o.id, false)}>
+                          Reject
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </Panel>
 
           <div className="panel panel-pad text-xs text-gray-500">

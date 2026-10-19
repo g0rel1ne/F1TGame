@@ -19,6 +19,7 @@ const CATEGORY_LABEL: Record<Transaction["category"], string> = {
   repairs: "Repairs",
   travel: "Travel",
   termination: "Contract termination",
+  transfer: "Transfer fees",
   investment: "Investment",
   "starting-capital": "Starting capital",
 };

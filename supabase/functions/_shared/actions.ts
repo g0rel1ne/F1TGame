@@ -10,6 +10,7 @@ import {
   advanceCalendar,
   aiDevelopmentRound,
   releaseDriver,
+  respondTransferOffer,
   runPracticeSession,
   runRaceWeekend,
   signDriver,
@@ -142,6 +143,15 @@ export function applyCareerAction(bundle: CareerBundle, action: Action, ctx: Act
       const contract = bundle.driverContracts.find((c) => c.driverId === action.driverId && c.active);
       if (contract) assertOwnsTeam(bundle, ctx.userId, contract.teamId);
       return { bundle: releaseDriver(bundle, action.driverId), extra };
+    }
+
+    case "respond-transfer-offer": {
+      const offer = (bundle.transferOffers ?? []).find((o) => o.id === action.offerId && o.status === "open");
+      if (!offer) throw new Error("This transfer offer is no longer available.");
+      const contract = bundle.driverContracts.find((c) => c.driverId === offer.driverId && c.active);
+      if (!contract) throw new Error("That driver is no longer under contract.");
+      assertOwnsTeam(bundle, ctx.userId, contract.teamId);
+      return { bundle: respondTransferOffer(bundle, action.offerId, Boolean(action.accept)), extra };
     }
 
     case "start-project": {

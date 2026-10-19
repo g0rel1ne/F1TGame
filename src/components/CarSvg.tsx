@@ -107,12 +107,20 @@ export function CarSvg({
   tuning,
   style,
   className = "",
+  x,
+  y,
+  width,
+  height,
 }: {
   paint: CarPaint;
   number?: string;
   tuning?: CarTuning;
   style?: CarStyle;
   className?: string;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
 }) {
   const uid = useId().replace(/:/g, "");
   const shade = `car-shade-${uid}`;
@@ -133,7 +141,7 @@ export function CarSvg({
   const tyreStroke = { stroke: EDGE, strokeWidth: 0.9, strokeOpacity: 0.55 };
 
   return (
-    <svg viewBox="0 0 320 120" className={className} role="img" aria-label="Formula car livery preview">
+    <svg viewBox="0 0 320 120" className={className} x={x} y={y} width={width} height={height} role={width != null ? undefined : "img"} aria-hidden={width != null ? true : undefined} aria-label={width != null ? undefined : "Formula car livery preview"}>
       <defs>
         <linearGradient id={shade} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor="#ffffff" stopOpacity="0.22" />

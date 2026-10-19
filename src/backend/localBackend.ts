@@ -15,8 +15,10 @@ import type {
   CareerActionExtra,
   Backend,
   AuthUser,
+  LiveTransport,
 } from "./types";
 import { DEFAULT_LOBBY_SETTINGS, settingsFromLobby } from "./types";
+import type { LiveMessage } from "../engine/liveSession";
 import type { Lobby, LobbyMember, LobbySettings, ChatMessage, RaceResult, FacilityKind, UpgradeArea } from "../engine/types";
 import type { CareerBundle } from "../engine/season";
 import {
@@ -27,6 +29,7 @@ import {
   createCareerBundle,
   processRaceResult,
   releaseDriver,
+  respondTransferOffer,
   runPracticeSession,
   runRaceWeekend,
   signDriver,
@@ -360,6 +363,15 @@ export class LocalBackend implements Backend {
         bundle = releaseDriver(bundle, action.driverId);
         break;
       }
+      case "respond-transfer-offer": {
+        const offer = (bundle.transferOffers ?? []).find((o) => o.id === action.offerId && o.status === "open");
+        if (!offer) throw new Error("This transfer offer is no longer available.");
+        const contract = bundle.driverContracts.find((c) => c.driverId === offer.driverId && c.active);
+        if (!contract) throw new Error("That driver is no longer under contract.");
+        this.assertOwnsTeam(bundle, userId, contract.teamId);
+        bundle = respondTransferOffer(bundle, action.offerId, action.accept);
+        break;
+      }
       case "start-project": {
         this.assertOwnsTeam(bundle, userId, action.teamId);
         if (!(action.area in UPGRADE_META)) throw new Error("Unknown research area.");
@@ -588,6 +600,37 @@ export class LocalBackend implements Backend {
   }
 
   // ---- realtime -----------------------------------------------------------
+
+  openLive(lobbyId: string, userId: string): LiveTransport {
+    const listeners = new Set<(message: LiveMessage, from: string) => void>();
+    if (typeof BroadcastChannel === "undefined") {
+      return { send() {}, listen: () => () => {}, close() {} };
+    }
+    const channel = new BroadcastChannel(`f1tp:live:${lobbyId}`);
+    channel.onmessage = (event: MessageEvent<{ from?: string; message?: LiveMessage }>) => {
+      const data = event.data;
+      if (!data || !data.message || typeof data.from !== "string") return;
+      for (const listener of listeners) listener(data.message, data.from);
+    };
+    return {
+      send: (message: LiveMessage) => {
+        try {
+          channel.postMessage({ from: userId, message });
+        } catch {
+          /* channel may be closed */
+        }
+      },
+      listen: (handler) => {
+        listeners.add(handler);
+        return () => listeners.delete(handler);
+      },
+      close: () => {
+        listeners.clear();
+        channel.close();
+      },
+    };
+  }
+
   subscribeLobby(lobbyId: string, onChange: () => void): () => void {
     if (!this.listeners.has(lobbyId)) this.listeners.set(lobbyId, new Set());
     this.listeners.get(lobbyId)!.add(onChange);

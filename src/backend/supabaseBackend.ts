@@ -12,12 +12,13 @@
  * Configure with VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY. See README.
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import type { Backend, CareerAction, CareerActionExtra, AuthUser } from "./types";
+import type { Backend, CareerAction, CareerActionExtra, AuthUser, LiveTransport } from "./types";
 import { DEFAULT_LOBBY_SETTINGS, settingsFromLobby } from "./types";
 import type { ChatMessage, Lobby, LobbySettings, RaceResult } from "../engine/types";
 import type { CareerBundle } from "../engine/season";
 import type { ContractOffer, NegotiationResult } from "../engine/drivermarket";
 import { createCareerBundle } from "../engine/season";
+import type { LiveMessage } from "../engine/liveSession";
 
 interface LobbyRow {
   id: string;
@@ -217,8 +218,55 @@ export class SupabaseBackend implements Backend {
     return { bundle: res.bundle as CareerBundle, result: res.result as RaceResult };
   }
 
-  async commitRace(): Promise<{ bundle: CareerBundle; result: RaceResult }> {
-    throw new Error("The interactive live race is only available offline. Online races are simulated by the host.");
+  async commitRace(lobbyId: string, userId: string, result: RaceResult): Promise<{ bundle: CareerBundle; result: RaceResult }> {
+    // The host simulated the race locally; the server re-validates the result
+    // against the shared career before processing points and finances.
+    const res = await this.invoke("commit-live-race", { lobbyId, userId, result });
+    return { bundle: res.bundle as CareerBundle, result: res.result as RaceResult };
+  }
+
+  openLive(lobbyId: string, userId: string): LiveTransport {
+    const client = this.client;
+    const channel = client.channel(`live:${lobbyId}`, { config: { broadcast: { self: false, ack: false } } });
+    const listeners = new Set<(message: LiveMessage, from: string) => void>();
+    let ready = false;
+    const pending: LiveMessage[] = [];
+    const flush = () => {
+      while (ready && pending.length > 0) {
+        const message = pending.shift()!;
+        void channel.send({ type: "broadcast", event: "live", payload: { from: userId, message } });
+      }
+    };
+    channel
+      .on("broadcast", { event: "live" }, (payload) => {
+        const data = payload.payload as { from?: string; message?: LiveMessage } | undefined;
+        if (!data || !data.message || typeof data.from !== "string" || data.from === userId) return;
+        for (const listener of listeners) listener(data.message, data.from);
+      })
+      .subscribe((status) => {
+        ready = status === "SUBSCRIBED";
+        if (ready) flush();
+      });
+    return {
+      send(message: LiveMessage) {
+        if (!ready) {
+          // Only the newest state matters; keep the queue tiny.
+          if (pending.length > 4) pending.shift();
+          pending.push(message);
+          return;
+        }
+        void channel.send({ type: "broadcast", event: "live", payload: { from: userId, message } });
+      },
+      listen(handler) {
+        listeners.add(handler);
+        return () => listeners.delete(handler);
+      },
+      close() {
+        listeners.clear();
+        pending.length = 0;
+        void client.removeChannel(channel);
+      },
+    };
   }
 
   subscribeLobby(lobbyId: string, onChange: () => void): () => void {

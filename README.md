@@ -348,6 +348,49 @@ alone.
 5. **Results** - points, prize money, sponsor bonuses, repair costs and
    standings update. The host advances to the next round.
 
+### Live races
+
+"Go live" (host only, once everyone is ready) runs the race in real time
+instead of simulating it instantly.
+
+- **One shared race.** The host's browser owns the simulation and streams a beat
+  to the lobby roughly once per lap. Guests render those beats, so every
+  principal sees the same positions, gaps, tyres and incidents - there is
+  nothing to de-sync. If the beats stop arriving, guests are told the race is
+  waiting for the host.
+- **Radio your own cars.** Any principal can change pace, tyre compound or box
+  their own two drivers at any moment. Commands for other teams are rejected by
+  the host, and the host re-validates every incoming command.
+- **Vote on the pace.** Everyone can vote for 1x, 2x or 4x, or vote to skip the
+  rest of the race. A vote only lands on a strict majority, so a two-principal
+  lobby has to agree; a principal racing on their own changes either instantly.
+- **Pausing** is the host's call, so nobody can stall the race for the others.
+- **Two track views.** The map defaults to *Cars*: top-down models painted in each
+  team's real livery, red-and-white kerbs, a pit lane with team pit boxes, and a
+  camera that follows your lead car (or the race leader if you field no cars) so
+  you can watch overtakes happen. The classic *Dots* view is still there as a
+  zoomed-out full-circuit overview - toggle it with the button on the map, and
+  your choice is remembered.
+- **Who owns the result.** Because the players drive the race live, the host's
+  client sends the finishing order. Everything that touches the career -
+  the race identity, qualifying and grid, which drivers and teams may appear,
+  the laps, and every championship point - is recomputed by the server in
+  `commit-live-race`, so a tampered client cannot award itself points or claim a
+  different circuit. That is the same trust boundary as a host-run simulation;
+  the server is the only writer.
+
+Offline, the same mechanism runs over a browser `BroadcastChannel`, so two tabs
+of the same browser watching the same lobby can race together.
+
+The live path has an integration test that talks to a real project:
+
+```
+$env:E2E_SUPABASE="1"; npx.cmd vitest run tests/e2e.commitLive.test.ts
+```
+
+It creates throwaway accounts and a lobby, so run it against a scratch project
+and tidy up afterwards.
+
 ### Career systems
 
 - Team identity, colours, livery, logo and engine supplier
@@ -358,12 +401,26 @@ alone.
 - Salaries, prize money, sponsors, transaction ledger and emergency funding
 - Championship standings, calendar, statistics, history and season rollover
 
+### Driver transfer market
+
+Between race weekends the AI teams work the market on their own:
+
+- They release a driver and sign a stronger free agent when one is available.
+- They poach a contracted driver from a rival AI team, settling a fee between the
+  two teams.
+- They approach **your** drivers. An incoming offer shows the bidding team, the
+  transfer fee, the salary and the contract length; accept it (the fee lands in
+  your account and the driver leaves, so sign a replacement) or reject it. Open
+  offers appear on the **Drivers** page and are also reported in the news feed.
+
 ### Multiplayer rules
 
 - One team per player per career.
 - The host owns calendar advancement, race starts, pause, host transfer and
   member removal.
 - Every online member must be ready before the host can start a race.
+- A race can be simulated instantly ("Quick sim") or raced live by everyone;
+  either way the host submits it and `commit-live-race` re-scores it.
 - Career state is stored as one versioned JSON snapshot. Browsers can read it;
   only Edge Functions can write it, so clients cannot fake results or money.
 - If two players act at the same instant, one gets a "career was updated"
