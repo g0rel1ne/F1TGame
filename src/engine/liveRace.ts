@@ -31,6 +31,7 @@ import { defaultTireSpecs, evaluateTire, isSlick, type TireSpec } from "./tire";
 import { applyDamage, initDamage, isTerminal, totalDamage } from "./damage";
 import { generateIncident, type IncidentContext, type NearbyCar } from "./incidents";
 import { evolveWeather } from "./weather";
+import { circuitIqWeight, racerSkill } from "./driverIq";
 import type { RaceSimEntrant } from "./race";
 
 export type Pace = "conserve" | "normal" | "push";
@@ -302,7 +303,7 @@ export class LiveRace {
           driverId: other.driverId,
           gap: -gap,
           aggression: other.driver.attributes.aggression,
-          skill: other.decisionSkill,
+          skill: clamp(other.decisionSkill * 0.5 + racerSkill(other.driver).iq * 0.5, 0, 1),
           defending: false,
         });
       }
@@ -326,7 +327,8 @@ export class LiveRace {
         fuelLaps: c.fuelLaps,
         nearby,
         severitySetting: this.severitySetting,
-        decisionSkill: c.decisionSkill,
+        // Mistakes are a driver trait first and a strategy-crew trait second.
+        decisionSkill: clamp(c.decisionSkill * 0.45 + racerSkill(c.driver).iq * 0.55, 0, 1),
       };
 
       const inc = generateIncident(rng, ctx, this.raceId);
@@ -581,6 +583,7 @@ export class LiveRace {
 
   private applyTraffic(rng: Rng, liveOrder: LiveCar[]): void {
     const { circuit } = this;
+    const iqWeight = circuitIqWeight(circuit);
     for (let i = 1; i < liveOrder.length; i++) {
       const attacker = liveOrder[i];
       const defender = liveOrder[i - 1];
@@ -588,17 +591,24 @@ export class LiveRace {
       const drsAvailable = circuit.drsZones.length > 0 && gap < 1.0 && this.weather.trackWetness < 0.35;
 
       if (gap < 1.4) {
+        const atk = racerSkill(attacker.driver);
+        const def = racerSkill(defender.driver);
         const paceAdvantage = defender.raw - attacker.raw;
-        const dirty = (1.4 - gap) * 0.12 * (0.6 + circuit.aeroDemand);
+        // A smart driver loses less time in dirty air - they manage the aero wash.
+        const dirty = (1.4 - gap) * 0.12 * (0.6 + circuit.aeroDemand) * (1.15 - atk.iq * 0.3);
         attacker.raw += dirty;
 
         if (paceAdvantage > 0.05) {
+          // Driver IQ turns a pace advantage into a pass: late braking into a
+          // heavy braking zone, a read on where the defender will cover.
           const passScore =
-            circuit.overtaking * 0.5 +
-            (attacker.driver.attributes.overtaking / 100) * 0.3 +
-            (drsAvailable ? 0.18 : 0) +
-            clamp(paceAdvantage * 0.15, 0, 0.15) -
-            (defender.driver.attributes.defending / 100) * 0.12;
+            circuit.overtaking * 0.42 +
+            atk.attack * 0.28 +
+            (drsAvailable ? 0.16 : 0) +
+            clamp(paceAdvantage * 0.15, 0, 0.15) +
+            (atk.iq - def.iq) * 0.12 +
+            circuit.brakingDemand * atk.attack * 0.08 * iqWeight -
+            def.defend * 0.16;
           if (rng.chance(clamp(passScore * 0.55, 0, 0.92))) {
             defender.raw += rng.range(0.05, 0.3);
           } else {

@@ -6,6 +6,7 @@ import { Badge, Panel } from "../components/ui";
 import { TrackMap, type TrackMarker } from "./TrackMap";
 import { RaceTrack, type RaceTrackCar } from "./RaceTrack";
 import { paintFromTeam, stylesFromTeam, DEFAULT_PAINT, DEFAULT_STYLE, type CarPaint, type CarStyle } from "./CarSvg";
+import { getTrack } from "../lib/trackGeometry";
 import { LiveRace, type DriverCommand, type LiveEvent, type LiveSnapshot, type Pace } from "../engine/liveRace";
 import { prepareRace, type CareerBundle } from "../engine/season";
 import {
@@ -338,14 +339,19 @@ export function LiveRaceView({
 
   const effProgress = finished ? 1 : progress;
 
+  // Shared geometry drives both the car view and the dots view. Its speed
+  // profile lets us place cars by time: they visibly brake for corners and
+  // accelerate out while the lap time stays authoritative.
+  const geo = useMemo(() => getTrack(circuit, 400, 240, 16, 10), [circuit]);
+  const lapLength = circuit.referenceLapSeconds || 90;
+
   const markers: TrackMarker[] = useMemo(() => {
     const cars = snapshot.cars.filter((c) => !c.retired);
-    const lapLength = circuit.referenceLapSeconds || 90;
     return cars.map((c) => {
       const d = bundle.drivers.find((x) => x.id === c.driverId);
       const t = bundle.teams.find((x) => x.id === c.teamId);
       const gapFraction = c.gapToLeader > 0 ? (c.gapToLeader / lapLength) % 1 : 0;
-      const p = (((effProgress - gapFraction) % 1) + 1) % 1;
+      const p = geo.progressAtTime(effProgress - gapFraction);
       const mine = mineIds.has(c.driverId);
       return {
         id: c.driverId,
@@ -355,7 +361,7 @@ export function LiveRaceView({
         highlight: mine || c.position === 1,
       };
     });
-  }, [snapshot.cars, effProgress, bundle.drivers, bundle.teams, mineIds, circuit.referenceLapSeconds]);
+  }, [snapshot.cars, effProgress, bundle.drivers, bundle.teams, mineIds, geo, lapLength]);
 
   /** On-screen progress of the leading car you control — used to lock the camera.
    *  If you field no cars (or have none running), follow the race leader instead. */
@@ -382,15 +388,18 @@ export function LiveRaceView({
   const pitBoxColors = useMemo(() => bundle.teams.map((t) => t.colors.primary), [bundle.teams]);
 
   const trackCars: RaceTrackCar[] = useMemo(() => {
-    const lapLength = circuit.referenceLapSeconds || 90;
     return snapshot.cars
       .filter((c) => !c.retired)
       .map((c) => {
         const d = bundle.drivers.find((x) => x.id === c.driverId);
         const t = bundle.teams.find((x) => x.id === c.teamId);
         const gapFraction = c.gapToLeader > 0 ? (c.gapToLeader / lapLength) % 1 : 0;
-        const p = (((effProgress - gapFraction) % 1) + 1) % 1;
+        const p = geo.progressAtTime(effProgress - gapFraction);
         const mine = mineIds.has(c.driverId);
+        // Traffic awareness: when running close to the car ahead, pull off the
+        // racing line into a side-by-side lane instead of driving through it.
+        const close = c.gapAhead !== null && c.gapAhead < 1.1;
+        const lane = close ? (c.position % 2 === 0 ? -1 : 1) * 1.15 * (1 - (c.gapAhead as number) / 1.1) : 0;
         return {
           id: c.driverId,
           progress: p,
@@ -400,10 +409,10 @@ export function LiveRaceView({
           code: mine || c.position <= 3 ? d?.code : undefined,
           highlight: mine || c.position === 1,
           pit: !!c.pit,
-          lane: c.position % 2 === 0 ? -0.62 : 0.62,
+          lane,
         };
       });
-  }, [snapshot.cars, effProgress, bundle.drivers, bundle.teams, mineIds, circuit.referenceLapSeconds, teamPaint, teamStyle]);
+  }, [snapshot.cars, effProgress, geo, lapLength, bundle.drivers, bundle.teams, mineIds, teamPaint, teamStyle]);
 
   useEffect(() => {
     localStorage.setItem("f1team.trackView", viewMode);

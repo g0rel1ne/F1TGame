@@ -1,7 +1,7 @@
 import { memo, useMemo } from "react";
 import type { Circuit } from "../engine/types";
 import { CarSvg, type CarPaint, type CarStyle } from "./CarSvg";
-import { buildTrack, type Pt } from "../lib/trackGeometry";
+import { getTrack, type Pt } from "../lib/trackGeometry";
 
 export interface RaceTrackCar {
   id: string;
@@ -12,6 +12,7 @@ export interface RaceTrackCar {
   code?: string;
   highlight?: boolean;
   pit?: boolean;
+  /** Extra lateral offset (px) used for side-by-side racing in traffic. */
   lane?: number;
 }
 
@@ -24,7 +25,8 @@ const Car = memo(CarSvg);
 
 const W = 400;
 const H = 240;
-const ROAD = 12;
+const ROAD = 10;
+const PAD = 16;
 
 export function RaceTrack({
   circuit,
@@ -45,10 +47,11 @@ export function RaceTrack({
   showPit?: boolean;
   pitBoxColors?: string[];
 }) {
-  const geo = useMemo(() => buildTrack(circuit, W, H, 28, ROAD), [circuit]);
+  const geo = useMemo(() => getTrack(circuit, W, H, PAD, ROAD), [circuit]);
 
-  const carLen = ROAD * 0.66;
+  const carLen = ROAD * 0.78;
   const carW = carLen * (120 / 320);
+  const maxLateral = ROAD / 2 - carW / 2 - 0.35;
 
   const pit = useMemo(() => {
     const side: 1 | -1 = -1;
@@ -79,15 +82,18 @@ export function RaceTrack({
 
   const placed = useMemo(
     () =>
-      cars.map((c, idx) => {
-        const lane = c.lane ?? (idx % 2 === 0 ? -0.6 : 0.6);
+      cars.map((c) => {
         const inPit = c.pit && (c.progress > 0.9 || c.progress < 0.12);
-        const lateral = inPit ? pit.side * pit.offset : lane * (ROAD * 0.3);
+        // All cars run the racing line; traffic adds a small side-by-side shift.
+        const racing = geo.racingOffsetAt(c.progress);
+        const lateral = inPit
+          ? pit.side * pit.offset
+          : Math.max(-maxLateral, Math.min(maxLateral, racing + (c.lane ?? 0)));
         const p = geo.offsetAt(c.progress, lateral);
         const deg = (geo.angleAt(c.progress) * 180) / Math.PI;
         return { car: c, p, deg };
       }),
-    [cars, geo, pit],
+    [cars, geo, pit, maxLateral],
   );
 
   const sectorPoints = showSectors ? circuit.sectors.map((s) => geo.pointAt(s.end)) : [];
@@ -124,21 +130,37 @@ export function RaceTrack({
       <rect x={-W} y={-H} width={W * 3} height={H * 3} fill="#0a0c10" />
 
       {/* Run-off */}
-      <path d={geo.path} fill="none" stroke="#151a20" strokeWidth={ROAD + 16} strokeLinejoin="round" strokeLinecap="round" />
+      <path d={geo.path} fill="none" stroke="#151a20" strokeWidth={ROAD + 14} strokeLinejoin="round" strokeLinecap="round" />
 
       {/* Track shadow + surface */}
       <path d={geo.path} fill="none" stroke="#000" strokeWidth={ROAD + 3} strokeLinejoin="round" strokeLinecap="round" opacity="0.5" />
       <path d={geo.path} fill="none" stroke={`url(#rt-asphalt-${circuit.id})`} strokeWidth={ROAD} strokeLinejoin="round" strokeLinecap="round" />
 
-      {/* Track edge lines */}
-      <path d={geo.offsetPath(0, 1, ROAD / 2 - 0.5, 220)} fill="none" stroke="#e6e9ee" strokeWidth="0.55" opacity="0.35" />
-      <path d={geo.offsetPath(0, 1, -(ROAD / 2 - 0.5), 220)} fill="none" stroke="#e6e9ee" strokeWidth="0.55" opacity="0.35" />
+      {/* Crossovers (Suzuka) - the later pass is the upper deck */}
+      {geo.bridges.map((b, i) => (
+        <g key={`bridge-${i}`}>
+          <path d={b.d} fill="none" stroke="#05060a" strokeWidth={ROAD + 4} strokeLinejoin="round" strokeLinecap="round" opacity="0.85" />
+          <path d={b.d} fill="none" stroke={`url(#rt-asphalt-${circuit.id})`} strokeWidth={ROAD + 0.4} strokeLinejoin="round" strokeLinecap="round" />
+        </g>
+      ))}
 
-      {/* Kerbs */}
+      {/* Track edge lines */}
+      <path d={geo.offsetPath(0, 1, ROAD / 2 - 0.35, 260)} fill="none" stroke="#e6e9ee" strokeWidth="0.5" opacity="0.4" />
+      <path d={geo.offsetPath(0, 1, -(ROAD / 2 - 0.35), 260)} fill="none" stroke="#e6e9ee" strokeWidth="0.5" opacity="0.4" />
+
+      {/* Kerbs, hugging the white line and clamped to the corner radius */}
       {geo.kerbRuns.map((run, i) => (
         <g key={i}>
-          <path d={run.d} fill="none" stroke="#f2f3f5" strokeWidth="2" strokeLinecap="butt" strokeLinejoin="round" />
-          <path d={run.d} fill="none" stroke="#e10600" strokeWidth="2" strokeLinecap="butt" strokeLinejoin="round" strokeDasharray="4.5 4.5" />
+          <path d={run.d} fill="none" stroke="#f2f3f5" strokeWidth={run.inside ? 1.7 : 2.3} strokeLinecap="butt" strokeLinejoin="round" />
+          <path
+            d={run.d}
+            fill="none"
+            stroke="#e10600"
+            strokeWidth={run.inside ? 1.7 : 2.3}
+            strokeLinecap="butt"
+            strokeLinejoin="round"
+            strokeDasharray={run.inside ? "3.6 3.6" : "4.4 4.4"}
+          />
         </g>
       ))}
 
