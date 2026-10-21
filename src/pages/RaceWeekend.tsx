@@ -403,7 +403,7 @@ function Row({ label, value }: { label: string; value: string }) {
 
 /** Real-time seconds one lap of the replay takes at 1x, scaled to the circuit. */
 function baseReplaySeconds(referenceLapSeconds: number): number {
-  return Math.min(9, Math.max(4, referenceLapSeconds / 13));
+  return Math.min(28, Math.max(16, referenceLapSeconds / 4));
 }
 
 function ReplaySection({ result, bundle }: { result: RaceResult; bundle: ReturnType<typeof useSession>["bundle"] }) {

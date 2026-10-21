@@ -6,7 +6,7 @@ import { Badge, Panel } from "../components/ui";
 import { TrackMap, type TrackMarker } from "./TrackMap";
 import { RaceTrack, type RaceTrackCar } from "./RaceTrack";
 import { paintFromTeam, stylesFromTeam, DEFAULT_PAINT, DEFAULT_STYLE, type CarPaint, type CarStyle } from "./CarSvg";
-import { LiveRace, sanitizeDriverCommand, type DriverCommand, type ErsMode, type FuelMode, type LiveEvent, type LiveRaceAudit, type LiveSnapshot, type Pace } from "../engine/liveRace";
+import { LiveRace, sanitizeDriverCommand, type DriverCommand, type ErsMode, type FuelMode, type LiveEvent, type LiveRaceAudit, type LiveSnapshot, type OvertakeMode, type Pace } from "../engine/liveRace";
 import { prepareRace, type CareerBundle } from "../engine/season";
 import { liveControlledDriverIds } from "../engine/liveAudit";
 import {
@@ -39,6 +39,14 @@ const PACE_META: Record<Pace, { label: string; tone: string; hint: string }> = {
   conserve: { label: "Manage", tone: "text-amber-300", hint: "Save tyres & fuel" },
   normal: { label: "Normal", tone: "text-gray-200", hint: "Balanced pace" },
   push: { label: "Push", tone: "text-emerald-300", hint: "Attack — more risk" },
+};
+const OVERTAKE_META: Record<OvertakeMode, { label: string; color: string }> = {
+  none: { label: "", color: "#94a3b8" },
+  slipstream: { label: "TOW", color: "#38bdf8" },
+  dive: { label: "DIVE", color: "#f59e0b" },
+  outside: { label: "AROUND THE OUTSIDE", color: "#a78bfa" },
+  switchback: { label: "SWITCHBACK", color: "#34d399" },
+  defend: { label: "DEFENDING", color: "#f87171" },
 };
 
 export interface LiveRacePeer {
@@ -138,8 +146,10 @@ export function LiveRaceView({
   const [pending, setPending] = useState<Record<string, Partial<DriverCommand>>>({});
   const [myVote, setMyVote] = useState<LiveSpeed | null>(null);
   const [mySkip, setMySkip] = useState(false);
+  const [restarting, setRestarting] = useState(false);
 
   const progRef = useRef(0);
+  const restartHoldRef = useRef(0);
   const speedRef = useRef(speed);
   const pausedRef = useRef(paused);
   const beatRef = useRef<LiveBeat | null>(null);
@@ -273,6 +283,25 @@ export function LiveRaceView({
         raf = requestAnimationFrame(loop);
         return;
       }
+      if (engine.flag === "red-flag") {
+        if (now - lastPublish > 100) {
+          lastPublish = now;
+          publishRef.current();
+        }
+        setProgress(progRef.current);
+        raf = requestAnimationFrame(loop);
+        return;
+      }
+      if (Date.now() < restartHoldRef.current) {
+        setProgress(0);
+        if (now - lastPublish > 100) {
+          lastPublish = now;
+          publishRef.current();
+        }
+        raf = requestAnimationFrame(loop);
+        return;
+      }
+      if (restarting) setRestarting(false);
       progRef.current += dt / (lapSeconds / speedRef.current);
       let stepped = false;
       while (progRef.current >= 1 && !engine.finished) {
@@ -297,7 +326,7 @@ export function LiveRaceView({
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [isHost, paused, done, engine, lapSeconds]);
+  }, [isHost, paused, done, engine, lapSeconds, restarting]);
 
   // ---- guest interpolation loop ----
   useEffect(() => {
@@ -489,10 +518,10 @@ export function LiveRaceView({
         const d = bundle.drivers.find((x) => x.id === c.driverId);
         const t = bundle.teams.find((x) => x.id === c.teamId);
         const mine = mineIds.has(c.driverId);
-        // Traffic awareness: when running close to the car ahead, pull off the
-        // racing line into a side-by-side lane instead of driving through it.
-        const close = c.gapAhead !== null && c.gapAhead < 1.1;
-        const lane = close ? (c.position % 2 === 0 ? -1 : 1) * 1.15 * (1 - (c.gapAhead as number) / 1.1) : 0;
+        // The engine chooses the racing line for attacks and defences; the UI
+        // only adds the two-wide grid stagger before the start.
+        const gridLane = !finished && (snapshot.lap === 0 || restarting) ? (c.position % 2 === 0 ? 1 : -1) * 1.35 : 0;
+        const lane = c.laneOffset + gridLane;
         return {
           id: c.driverId,
           progress: c.trackProgress,
@@ -504,7 +533,11 @@ export function LiveRaceView({
           pit: !!c.pit,
           lane,
           speed: c.speed,
+          brake: c.brake,
+          throttle: c.throttle,
           braking: c.braking,
+          tow: c.tow,
+          overtakeMode: c.overtakeMode,
           drs: c.drs,
           blueFlag: c.blueFlag,
           pitPhase: c.pitPhase,
@@ -514,7 +547,7 @@ export function LiveRaceView({
           elevationMetres: c.elevationMetres,
         };
       });
-  }, [snapshot.cars, bundle.drivers, bundle.teams, mineIds, teamPaint, teamStyle]);
+  }, [snapshot.cars, snapshot.lap, finished, restarting, bundle.drivers, bundle.teams, mineIds, teamPaint, teamStyle]);
 
   useEffect(() => {
     localStorage.setItem("f1team.trackView", viewMode);
@@ -547,6 +580,18 @@ export function LiveRaceView({
     setPaused(true);
     setDone(true);
     setSkipVote(false);
+    setTick((t) => t + 1);
+    publishRef.current();
+  };
+
+  const restartAfterRedFlag = () => {
+    if (!engine || !isHost || engine.flag !== "red-flag") return;
+    engine.resumeFromRedFlag();
+    restartHoldRef.current = Date.now() + 3200;
+    progRef.current = 0;
+    setProgress(0);
+    setRestarting(true);
+    setPaused(false);
     setTick((t) => t + 1);
     publishRef.current();
   };
@@ -665,10 +710,25 @@ export function LiveRaceView({
               </div>
             )}
             {flag === "red-flag" && (
-              <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center bg-red-950/45">
-                <div className="rounded-xl border border-red-400/40 bg-red-950/90 px-5 py-3 text-center">
+              <div className="absolute inset-0 z-10 grid place-items-center bg-red-950/45">
+                <div className="rounded-xl border border-red-400/40 bg-red-950/90 px-5 py-4 text-center shadow-2xl">
                   <div className="text-sm font-bold uppercase tracking-[0.25em] text-red-300">Red flag</div>
-                  <div className="mt-1 text-[11px] text-red-200/80">Session stopped — field holds on the grid</div>
+                  <div className="mt-1 text-[11px] text-red-200/80">Race suspended - set your tyres, ERS and fuel, then restart.</div>
+                  {isHost ? (
+                    <button className="btn-primary mt-3 py-1.5 text-xs" onClick={restartAfterRedFlag}>
+                      Restart race
+                    </button>
+                  ) : (
+                    <div className="mt-2 text-[10px] uppercase tracking-wider text-red-200/60">Waiting for the host to restart</div>
+                  )}
+                </div>
+              </div>
+            )}
+            {restarting && !finished && (
+              <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center bg-black/25">
+                <div className="rounded-xl border border-emerald-400/40 bg-carbon-950/90 px-5 py-3 text-center shadow-2xl">
+                  <div className="text-sm font-bold uppercase tracking-[0.25em] text-emerald-300">Standing restart</div>
+                  <div className="mt-1 text-[11px] text-gray-400">Field reformed - lights out</div>
                 </div>
               </div>
             )}
@@ -909,6 +969,8 @@ export function LiveRaceView({
                             <span className="rounded bg-carbon-900 px-1.5 py-0.5 text-sky-300">ERS {Math.round(c.ersCharge * 100)}%</span>
                             <span className={`rounded bg-carbon-900 px-1.5 py-0.5 ${c.fuelLaps < 3 ? "text-red-300" : "text-amber-300"}`}>FUEL {c.fuelLaps.toFixed(1)}L</span>
                             {c.drs && <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-cyan-300">DRS</span>}
+                            {c.brake > 0.18 && <span className="rounded bg-red-500/15 px-1.5 py-0.5 text-red-300">BRAKE {Math.round(c.brake * 100)}%</span>}
+                            {c.tow > 0.3 && <span className="rounded bg-sky-500/15 px-1.5 py-0.5 text-sky-300">TOW {Math.round(c.tow * 100)}%</span>}
                             {c.blueFlag && <span className="rounded bg-blue-500/15 px-1.5 py-0.5 text-blue-300">BLUE FLAG</span>}
                             {c.penaltyCount > 0 && <span className="rounded bg-red-500/15 px-1.5 py-0.5 text-red-300">+{c.penaltySeconds}s</span>}
                           </div>
@@ -960,6 +1022,16 @@ export function LiveRaceView({
                       <span className="h-2.5 w-1 rounded-sm" style={{ background: t?.colors.primary ?? "#666" }} />
                       {d?.name ?? c.driverId}
                       {mine && <span className="rounded bg-race-teal/20 px-1 text-[9px] font-bold uppercase text-race-teal">You</span>}
+                      {c.overtakeMode !== "none" && (
+                        <span className="rounded px-1 text-[9px] font-bold uppercase tracking-wider" style={{ color: OVERTAKE_META[c.overtakeMode].color, background: `${OVERTAKE_META[c.overtakeMode].color}1f` }}>
+                          {OVERTAKE_META[c.overtakeMode].label}
+                        </span>
+                      )}
+                      {c.pitPhase !== "none" && (
+                        <span className="rounded bg-amber-400/15 px-1 text-[9px] font-bold uppercase tracking-wider text-amber-300">
+                          {c.pitPhase === "stop" ? "PIT STOP" : `PIT ${c.pitPhase}`}
+                        </span>
+                      )}
                     </span>
                   </td>
                   <td className="px-3 py-1.5 text-xs text-gray-500">{t?.shortName}</td>
@@ -969,7 +1041,7 @@ export function LiveRaceView({
                       <span className="h-2.5 w-2.5 rounded-full" style={{ background: COMPOUND_COLOR[c.compound] }} />{c.tireAge}
                     </span>
                   </td>
-                  <td className="px-3 py-1.5 text-right font-mono text-xs text-gray-500">{c.pits}</td>
+                  <td className="px-3 py-1.5 text-right font-mono text-xs text-gray-500">{c.pits > 0 ? `${c.pits} � ${c.lastPitStopSeconds.toFixed(1)}s` : "0"}</td>
                 </tr>
               );
             })}

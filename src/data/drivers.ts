@@ -88,7 +88,7 @@ function mk(seed: DriverSeed, id: string, salt = ""): Driver {
   };
 }
 
-const FICTIONAL_SEEDS: DriverSeed[] = [
+export const FICTIONAL_SEEDS: DriverSeed[] = [
   { name: "Alex Mercer", code: "MER", nationality: "British", country: "GB", age: 31, tier: "elite", traits: ["consistent", "veteran"] },
   { name: "Luca Moretti", code: "MOR", nationality: "Italian", country: "IT", age: 27, tier: "elite", traits: ["aggressive"] },
   { name: "Elias Novak", code: "NOV", nationality: "Czech", country: "CZ", age: 25, tier: "good", traits: ["qualifying-specialist"] },
@@ -140,7 +140,7 @@ const FICTIONAL_SEEDS: DriverSeed[] = [
  * Real-world driver names for the AI grid. Kept separate and clearly flagged.
  * Set `useRealDrivers` to false in roster config to run a fully fictional grid.
  */
-const REAL_SEEDS: DriverSeed[] = [
+export const REAL_SEEDS: DriverSeed[] = [
   { name: "Arvid Lindblad", code: "LIN", nationality: "British", country: "GB", age: 20, tier: "rookie", isRealPerson: true },
   { name: "Isack Hadjar", code: "HAD", nationality: "French", country: "FR", age: 22, tier: "good", isRealPerson: true },
   { name: "Gabriel Bortoleto", code: "BOR", nationality: "Brazilian", country: "BR", age: 22, tier: "good", isRealPerson: true },

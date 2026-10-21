@@ -116,7 +116,7 @@ export function speedTally(votes: Record<string, LiveSpeed>, memberIds: string[]
  * down heavily — a race is something you watch, not blink through.
  */
 export function baseLapSeconds(referenceLapSeconds: number): number {
-  return Math.min(11, Math.max(5.5, referenceLapSeconds / 11));
+  return Math.min(36, Math.max(22, referenceLapSeconds / 3));
 }
 
 /** Real-world milliseconds per lap at a given speed. */

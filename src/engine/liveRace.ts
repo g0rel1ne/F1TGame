@@ -87,6 +87,9 @@ export type LiveEventKind =
   | "start" | "overtake" | "pit" | "flag" | "incident"
   | "radio" | "retire" | "lead" | "fastest" | "finish" | "weather";
 
+/** A visible sub-lap battle technique, derived from the circuit profile. */
+export type OvertakeMode = "none" | "slipstream" | "dive" | "outside" | "switchback" | "defend";
+
 export interface LiveEvent {
   id: string;
   lap: number;
@@ -114,6 +117,8 @@ export interface LiveCarView {
   pitCompound: Compound | null;
   retired: boolean;
   pits: number;
+  /** Stationary time of the most recent stop, in seconds. */
+  lastPitStopSeconds: number;
   pace: Pace;
   fuelMode: FuelMode;
   ers: ErsMode;
@@ -129,7 +134,18 @@ export interface LiveCarView {
   lapsCompleted: number;
   /** Current local speed, 0..1 of a flat-out straight. */
   speed: number;
+  /** Braking force 0..1, used for brake-light intensity and deceleration. */
+  brake: number;
+  /** Throttle opening 0..1 out of the corner. */
+  throttle: number;
   braking: boolean;
+  /** Dirty-air tow from the car ahead, 0..1. */
+  tow: number;
+  /** Lateral racing-line offset in track pixels, used for side-by-side battles. */
+  laneOffset: number;
+  overtakeMode: OvertakeMode;
+  overtakeTargetId: string | null;
+  defending: boolean;
   drs: boolean;
   blueFlag: boolean;
   penaltyCount: number;
@@ -184,6 +200,9 @@ interface LiveCar extends CarRuntime {
   gridPosition: number;
   raw: number;
   pitThisLap: boolean;
+  /** Lap on which the last stop was made, used to animate the pit exit. */
+  pitStopLap: number | null;
+  lastPitStopSeconds: number;
   nextPitIndex: number;
   cumulativeTime: number;
   lapsCompleted: number;
@@ -207,6 +226,17 @@ const FUEL_DELTA: Record<FuelMode, number> = { lean: 0.24, standard: 0, rich: -0
 const FUEL_BURN: Record<FuelMode, number> = { lean: 0.66, standard: 1, rich: 1.28 };
 const ERS_DELTA: Record<ErsMode, number> = { off: 0.1, medium: -0.06, high: -0.2 };
 const ERS_DRAIN: Record<ErsMode, number> = { off: 0, medium: 0.14, high: 0.32 };
+const GRID_GAP_SECONDS = 0.22;
+
+/** Stable 0..1 value for deterministic battle intent across broadcast frames. */
+function stableUnit(seed: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) / 4294967296;
+}
 
 /** Radio acknowledgements, picked by pace so the engineer feels alive. */
 const PACE_ACK: Record<Pace, string[]> = {
@@ -243,6 +273,7 @@ export class LiveRace {
   private readonly poleDriverId: string | null;
   private readonly profile: CircuitProfile;
   private neutralisedLaps = 0;
+  private redFlagGridSet = false;
   private eventSeq = 0;
   private overallBest = Number.POSITIVE_INFINITY;
   private prevCondition: string;
@@ -293,8 +324,10 @@ export class LiveRace {
           gridPosition: e.gridPosition,
           raw: 0,
           pitThisLap: false,
+          pitStopLap: null,
+          lastPitStopSeconds: 0,
           nextPitIndex: 0,
-          cumulativeTime: e.gridPosition * 0.7,
+          cumulativeTime: e.gridPosition * GRID_GAP_SECONDS,
           lapsCompleted: 0,
           controlled: controlled.has(e.driverId),
           controlMode: controlled.has(e.driverId) ? "human" : "ai",
@@ -374,10 +407,49 @@ export class LiveRace {
     );
   }
 
+  /**
+   * End a red-flag suspension. The neutralised steps are deterministic, so the
+   * audit replay reaches the same state even though the host held the clock.
+   */
+  resumeFromRedFlag(): LiveEvent[] {
+    if (this.flag !== "red-flag") return [];
+    const firstNew = this.events.length;
+    let guard = 0;
+    while (this.flag === "red-flag" && guard < 20) {
+      this.step();
+      guard++;
+    }
+    this.neutralisedLaps = 0;
+    this.flag = "green";
+    this.redFlagGridSet = false;
+    return this.events.slice(firstNew);
+  }
+
   /** Advance exactly one lap. Returns the events produced by that lap. */
   step(): LiveEvent[] {
     if (this.finished) return [];
     const firstNew = this.events.length;
+
+    // A red flag suspends the race clock instead of consuming race laps.
+    // The host can hold the broadcast here while the field regroups; the
+    // deterministic audit replay simply steps through the same suspension.
+    if (this.flag === "red-flag") {
+      this.neutralisedLaps = Math.max(0, this.neutralisedLaps - 1);
+      if (this.neutralisedLaps === 0) {
+        this.flag = "green";
+        this.redFlagGridSet = false;
+        for (const c of this.cars) {
+          c.broadcastProgress = 0;
+          c.broadcastSpeed = 0;
+          c.broadcastBraking = false;
+          c.broadcastDrs = false;
+          c.contact = 0;
+        }
+        this.pushEvent(this.lap, "flag", "Race restarted from the grid.", "#34d399", "good");
+      }
+      return this.events.slice(firstNew);
+    }
+
     const lap = this.lap + 1;
     this.lap = lap;
     const { circuit, totalLaps, specs, rng } = this;
@@ -415,7 +487,7 @@ export class LiveRace {
     }
 
     if (neutralised) {
-      const base = this.flag === "red-flag" ? 0 : circuit.referenceLapSeconds * 1.5;
+      const base = circuit.referenceLapSeconds * 1.5;
       liveOrder.forEach((c, i) => {
         c.raw = base;
         if (this.flag === "safety-car") c.cumulativeTime = liveOrder[0].cumulativeTime + i * 0.8;
@@ -550,6 +622,17 @@ export class LiveRace {
       }
     }
 
+    // A red flag stops the lap before it is completed: the race clock rolls
+    // back so the interrupted lap is re-run after the standing restart.
+    if (this.flag === "red-flag") {
+      this.lap = lap - 1;
+      if (!this.redFlagGridSet) {
+        this.prepareRestartGrid(afterOrder);
+        this.redFlagGridSet = true;
+      }
+      return this.events.slice(firstNew);
+    }
+
     this.recordLap(afterOrder, pittedThisLap, lap);
 
     // Radio reminder if a controlled car's tyres are past their prime.
@@ -598,7 +681,8 @@ export class LiveRace {
 
     const projected = this.cars.map((c) => {
       const target = Math.max(45, c.lapTarget || this.circuit.referenceLapSeconds);
-      const elapsed = u * leaderTarget - c.gapToLeader;
+      const gapToLeader = c.cumulativeTime - (leader?.cumulativeTime ?? 0);
+      const elapsed = u * leaderTarget - gapToLeader;
       let distance = leaderLaps + elapsed / target;
       let timeFraction = (elapsed / target) % 1;
       if (timeFraction < 0) timeFraction += 1;
@@ -613,17 +697,33 @@ export class LiveRace {
       }
 
       const progress = this.finished ? 1 : this.profile.progressAtTime(timeFraction);
-      const speed = this.finished || this.flag === "red-flag" ? 0 : this.profile.speedAt(progress) * (this.circuit.referenceLapSeconds / target);
-      const ahead = this.profile.speedAt((progress + 0.02) % 1);
+      const profileSpeed = this.profile.speedAt(progress);
+      const speed = this.finished || this.flag === "red-flag" ? 0 : profileSpeed * (this.circuit.referenceLapSeconds / target);
       const cornerNow = this.profile.cornerAt(progress);
-      const cornerAhead = this.profile.cornerAt((progress + 0.02) % 1);
-      const braking = !this.finished && (speed > ahead * 1.003 || (cornerAhead !== null && cornerAhead !== cornerNow));
+      const cornerAhead = this.profile.cornerAt((progress + 0.045) % 1);
+      let cornerSpeed = profileSpeed;
+      for (let ahead = 0.004; ahead <= 0.075; ahead += 0.004) {
+        cornerSpeed = Math.min(cornerSpeed, this.profile.speedAt((progress + ahead) % 1));
+      }
+      const brake = !this.finished && this.flag !== "red-flag"
+        ? clamp((profileSpeed - cornerSpeed) / 0.22 + Math.max(0, profileSpeed - this.profile.speedAt((progress - 0.012 + 1) % 1)) * 0.2, 0, 1)
+        : 0;
+      const braking = brake > 0.08 || (cornerNow !== null && profileSpeed < 0.8) || (cornerAhead !== null && cornerAhead !== cornerNow);
+      const throttle = this.finished || this.flag !== "green" ? 0 : clamp((profileSpeed - 0.3) / 0.7, 0, 1);
+      const direction = this.profile.directionAt((progress + 0.018) % 1) || this.profile.directionAt(progress) || (c.gridPosition % 2 === 0 ? 1 : -1);
       const drsZone = this.circuit.drsZones.some((z) => {
         const span = (z.end - z.start + 1) % 1;
         const rel = (progress - z.start + 1) % 1;
         return rel <= (span || 1);
       });
-      return { c, target, distance, progress, timeFraction, speed, braking, drsZone };
+      return {
+        c, target, distance, progress, timeFraction, speed, braking, brake, throttle, direction, drsZone,
+        overtakeMode: "none" as OvertakeMode,
+        laneOffset: 0,
+        tow: 0,
+        defending: false,
+        overtakeTargetId: null as string | null,
+      };
     });
 
     // Safety-car queue: the leader controls the pace and the field closes up.
@@ -644,27 +744,102 @@ export class LiveRace {
     });
     const leaderDistance = sorted[0]?.distance ?? 0;
 
+    // Corner-by-corner battle intent. A car close enough to the car ahead
+    // chooses a real technique: sit in the tow, lunge up the inside under
+    // braking, go around the outside, or switch back after the apex. The
+    // defender covers the inside if their racecraft says they saw it coming.
+    if (this.flag === "green" && !this.finished && this.lap > 0) {
+      for (let i = 1; i < sorted.length; i++) {
+        const p = sorted[i];
+        const ahead = sorted[i - 1];
+        if (p.c.retired || ahead.c.retired) continue;
+        const gap = Math.max(0, (ahead.distance - p.distance) * p.target);
+        if (gap > 1.1) continue;
+
+        const corner = this.profile.cornerAt((p.progress + 0.03) % 1);
+        const cornerKey = corner ?? Math.round(((p.progress + 0.03) % 1) * 10);
+        const brakingZone = p.brake > 0.16 || this.profile.speedAt((p.progress + 0.035) % 1) < p.speed * 0.95;
+        const drsUsable = p.drsZone && gap < 1 && this.weather.trackWetness < 0.35;
+        const paceDelta = ahead.c.lapTarget - p.c.lapTarget;
+        const attackSkill = (p.c.driver.attributes.overtaking + p.c.driver.attributes.aggression * 100) / 2;
+        const intent = stableUnit(`${this.seed}:attack:${this.lap}:${p.c.driverId}:${cornerKey}`);
+        const late = intent > 0.5;
+        const inside = p.direction || (p.c.gridPosition % 2 === 0 ? 1 : -1);
+
+        let mode: OvertakeMode = "none";
+        let lane = 0;
+        if (brakingZone && gap < 0.55 && (late || attackSkill > 62)) {
+          mode = "dive";
+          lane = inside * 1.55;
+        } else if (drsUsable && gap < 0.9) {
+          mode = "slipstream";
+        } else if (brakingZone && gap < 0.9 && intent > 0.42) {
+          mode = "outside";
+          lane = -inside * 1.35;
+        } else if (gap < 0.7 && paceDelta > 0 && intent > 0.52) {
+          mode = "slipstream";
+        } else {
+          continue;
+        }
+
+        if (ahead.overtakeMode === "none" && !ahead.defending) {
+          const defence = ahead.c.driver.attributes.defending;
+          const cover = stableUnit(`${this.seed}:defend:${this.lap}:${ahead.c.driverId}:${cornerKey}`) * 100 < defence + 18;
+          if (cover) {
+            ahead.overtakeMode = "defend";
+            ahead.defending = true;
+            ahead.overtakeTargetId = p.c.driverId;
+            ahead.laneOffset = (ahead.direction || inside) * 1.35;
+          }
+        }
+
+        if (ahead.defending && lane !== 0 && Math.sign(ahead.laneOffset) === Math.sign(lane)) {
+          mode = mode === "dive" ? "switchback" : "outside";
+          lane = -inside * 1.35;
+        }
+
+        p.overtakeMode = mode;
+        p.laneOffset = lane;
+        p.tow = clamp(1 - gap / 1.1, 0, 1) * (drsUsable ? 1 : 0.62);
+        p.overtakeTargetId = ahead.c.driverId;
+      }
+    }
+
     const cars: LiveCarView[] = sorted.map((p, i) => {
       const c = p.c;
-      const inPitWindow = c.command.pitRequest && !c.retired && !this.finished && (p.progress > 0.885 || p.progress < 0.075);
-      const pitPhase: PitPhase = c.retired || !inPitWindow
+      // Pit animation follows the broadcast clock so every car gets a clear
+      // entry, stationary stop and exit, even when its own lap is offset.
+      const plannedPitLap = c.strategy.pitLaps[c.nextPitIndex];
+      const aiPitNow =
+        !c.controlled &&
+        !c.retired &&
+        plannedPitLap !== undefined &&
+        plannedPitLap === this.lap + 1 &&
+        c.nextPitIndex < c.strategy.compounds.length - 1;
+      const pitRequestWindow = (c.command.pitRequest || aiPitNow) && !c.retired && !this.finished && u > 0.9;
+      const pitExitWindow = !c.retired && !this.finished && c.pitStopLap === this.lap && u < 0.08;
+      const inPitWindow = pitRequestWindow || pitExitWindow;
+      const pitPhase: PitPhase = !inPitWindow
         ? "none"
-        : p.progress > 0.97 || p.progress < 0.02
-          ? "stop"
-          : p.progress > 0.9
-            ? "entry"
-            : "exit";
-      const pitProgress = inPitWindow
-        ? p.progress > 0.9
-          ? clamp((p.progress - 0.885) / 0.115, 0, 1)
-          : clamp((p.progress + 0.115) / 0.19, 0, 1)
-        : 0;
+        : pitExitWindow
+          ? "exit"
+          : u > 0.965
+            ? "stop"
+            : "entry";
+      const pitProgress = !inPitWindow
+        ? 0
+        : pitRequestWindow
+          ? u > 0.965
+            ? 1
+            : clamp((u - 0.9) / 0.065, 0, 1)
+          : clamp(1 - u / 0.08, 0, 1);
       const ahead = sorted[i - 1];
       const gapAhead = ahead ? Math.max(0, (ahead.distance - p.distance) * p.target) : null;
       const gapToLeader = Math.max(0, (leaderDistance - p.distance) * p.target);
       const blueFlag = !c.retired && leaderDistance - p.distance > 0.78 && leaderDistance - p.distance < 1.2;
-      const contact = ahead && gapAhead !== null && gapAhead < 0.32 && !c.retired && !ahead.c.retired
-        ? clamp(1 - gapAhead / 0.32, 0, 1)
+      const lateralGap = ahead ? Math.abs(p.laneOffset - ahead.laneOffset) : 99;
+      const contact = ahead && gapAhead !== null && gapAhead < 0.42 && lateralGap < 1.15 && !c.retired && !ahead.c.retired
+        ? clamp((1 - gapAhead / 0.42) * (1 - lateralGap / 1.15), 0, 1)
         : 0;
       const drs = !!ahead && p.drsZone && gapAhead !== null && gapAhead < 1.0 && this.weather.trackWetness < 0.35;
 
@@ -689,6 +864,7 @@ export class LiveRace {
         pitCompound: c.command.pitCompound,
         retired: c.retired,
         pits: c.pitsMade,
+        lastPitStopSeconds: round(c.lastPitStopSeconds, 2),
         pace: c.command.pace,
         fuelMode: c.command.fuelMode,
         ers: c.command.ers,
@@ -700,7 +876,14 @@ export class LiveRace {
         trackProgress: p.progress,
         lapsCompleted: c.lapsCompleted,
         speed: round(p.speed, 3),
+        brake: round(p.brake, 3),
+        throttle: round(p.throttle, 3),
         braking: p.braking,
+        tow: round(p.tow, 3),
+        laneOffset: p.laneOffset,
+        overtakeMode: p.overtakeMode,
+        overtakeTargetId: p.overtakeTargetId,
+        defending: p.defending,
         drs,
         blueFlag,
         penaltyCount: c.penaltyCount,
@@ -848,6 +1031,21 @@ export class LiveRace {
     return [...this.running()].sort((a, b) => a.cumulativeTime - b.cumulativeTime);
   }
 
+  /** Line the field up in current order with the gaps erased, as after a red flag. */
+  private prepareRestartGrid(order: LiveCar[]): void {
+    const leader = order[0];
+    if (!leader) return;
+    const base = leader.cumulativeTime;
+    order.forEach((c, i) => {
+      const lapsDown = leader.lapsCompleted - c.lapsCompleted;
+      c.cumulativeTime = base + lapsDown * this.circuit.referenceLapSeconds + i * GRID_GAP_SECONDS;
+      c.raw = 0;
+      c.pitThisLap = false;
+      c.pitStopLap = null;
+      c.broadcastProgress = 0;
+    });
+  }
+
   private envFor(c: LiveCar) {
     return {
       trackWetness: this.weather.trackWetness,
@@ -874,29 +1072,40 @@ export class LiveRace {
       const gap = attacker.cumulativeTime - defender.cumulativeTime;
       const drsAvailable = circuit.drsZones.length > 0 && gap < 1.0 && this.weather.trackWetness < 0.35;
 
-      if (gap < 1.4) {
+      if (gap < 1.5) {
         const atk = racerSkill(attacker.driver);
         const def = racerSkill(defender.driver);
         const paceAdvantage = defender.raw - attacker.raw;
         // A smart driver loses less time in dirty air - they manage the aero wash.
-        const dirty = (1.4 - gap) * 0.12 * (0.6 + circuit.aeroDemand) * (1.15 - atk.iq * 0.3);
+        const dirty = (1.5 - gap) * 0.12 * (0.6 + circuit.aeroDemand) * (1.15 - atk.iq * 0.3);
         attacker.raw += dirty;
 
-        if (paceAdvantage > 0.05) {
-          // Driver IQ turns a pace advantage into a pass: late braking into a
-          // heavy braking zone, a read on where the defender will cover.
+        // DRS and a good tow can create an attempt even without a clear pace
+        // advantage; the pass itself still has to be completed on track.
+        const canAttack = drsAvailable || paceAdvantage > -0.35;
+        if (canAttack) {
+          const technique =
+            circuit.brakingDemand > 0.58 && atk.attack > 0.52
+              ? "late lunge"
+              : drsAvailable
+                ? "slipstream"
+                : "switchback";
+          const techniqueBonus =
+            technique === "late lunge" ? circuit.brakingDemand * 0.1
+              : technique === "slipstream" ? 0.08
+                : 0.05;
           const passScore =
-            circuit.overtaking * 0.42 +
-            atk.attack * 0.28 +
-            (drsAvailable ? 0.16 : 0) +
-            clamp(paceAdvantage * 0.15, 0, 0.15) +
+            circuit.overtaking * 0.38 +
+            atk.attack * 0.26 +
+            (drsAvailable ? 0.12 : 0) +
+            clamp(paceAdvantage * 0.15, 0, 0.14) +
             (atk.iq - def.iq) * 0.12 +
-            circuit.brakingDemand * atk.attack * 0.08 * iqWeight -
-            def.defend * 0.16;
-          if (rng.chance(clamp(passScore * 0.55, 0, 0.92))) {
+            techniqueBonus * iqWeight -
+            def.defend * 0.17;
+          if (rng.chance(clamp(passScore * 0.6, 0.04, 0.9))) {
             defender.raw += rng.range(0.05, 0.3);
           } else {
-            attacker.raw = defender.raw + rng.range(0.03, 0.25);
+            attacker.raw = Math.max(attacker.raw, defender.raw + rng.range(0.02, 0.22));
           }
         }
       }
@@ -939,9 +1148,12 @@ export class LiveRace {
 
       if (!shouldStop) continue;
 
-      const pitLoss = circuit.pitLossSeconds * (underNeutralisation ? 0.55 : 1) + rng.gaussian(0, 1.2) + c.driver.attributes.concentration * -0.01;
-      const stopTime = clamp(pitLoss, 14, 40);
-      c.raw += stopTime;
+      const laneLoss = circuit.pitLossSeconds * (underNeutralisation ? 0.55 : 1) + rng.gaussian(0, 1.2) + c.driver.attributes.concentration * -0.01;
+      const stationary = clamp(2.2 + rng.gaussian(0, 0.42) + (100 - c.driver.attributes.concentration) * 0.012, 1.8, 4.8);
+      const pitLoss = clamp(laneLoss + stationary, 14, 42);
+      c.raw += pitLoss;
+      c.pitStopLap = lap;
+      c.lastPitStopSeconds = stationary;
 
       c.compound = next;
       c.tireAgeLaps = 0;
@@ -1018,7 +1230,11 @@ export class LiveRace {
       if (!passed) continue;
       const a = this.cars.find((c) => c.driverId === e.driverId);
       const b = this.cars.find((c) => c.driverId === passed.driverId);
-      if (a && b) this.pushEvent(lap, "overtake", `${a.driver.name} passes ${b.driver.name} for P${e.position}.`, "#93c5fd", "info", e.driverId);
+      if (a && b) {
+        const moves = ["late lunge", "move around the outside", "switchback"];
+        const technique = moves[Math.floor(stableUnit(`${this.seed}:move:${lap}:${e.driverId}`) * moves.length)] ?? moves[0];
+        this.pushEvent(lap, "overtake", `${a.driver.name} passes ${b.driver.name} with a ${technique} for P${e.position}.`, "#93c5fd", "info", e.driverId);
+      }
     }
   }
 

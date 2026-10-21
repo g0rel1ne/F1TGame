@@ -2,13 +2,13 @@ import type { StaffMember, StaffRole } from "../engine/types";
 import { Rng, clamp, round } from "../engine/rng";
 
 /** Fictional staff name pools. */
-const FIRST = [
+export const FIRST = [
   "Adrian", "Beatrice", "Carlos", "Delphine", "Eduardo", "Freya", "Gareth", "Helena",
   "Igor", "Julia", "Kwame", "Lorenzo", "Mira", "Nadia", "Otto", "Priya",
   "Quentin", "Rosa", "Stefan", "Tessa", "Umberto", "Valentina", "Willem", "Ximena",
   "Yusuf", "Zara", "Amara", "Boris", "Camille", "Dmitri",
 ];
-const LAST = [
+export const LAST = [
   "Alvarez", "Bakker", "Costa", "Dubois", "Eriksen", "Fontaine", "Girard", "Hoffmann",
   "Ibarra", "Jensen", "Keller", "Lombardi", "Moreau", "Novak", "Okafor", "Petrov",
   "Quintero", "Ricci", "Schmidt", "Tanaka", "Ulrich", "Vargas", "Weber", "Yilmaz",

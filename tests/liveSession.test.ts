@@ -66,9 +66,9 @@ describe("live session voting", () => {
 
 describe("live session pacing", () => {
   it("keeps a lap watchable regardless of the real lap time", () => {
-    expect(baseLapSeconds(60)).toBe(5.5);
-    expect(baseLapSeconds(100)).toBeCloseTo(9.09, 1);
-    expect(baseLapSeconds(90)).toBeCloseTo(8.18, 1);
+    expect(baseLapSeconds(60)).toBe(22);
+    expect(baseLapSeconds(100)).toBeCloseTo(33.33, 1);
+    expect(baseLapSeconds(90)).toBe(30);
   });
 
   it("scales lap length linearly with the chosen speed", () => {

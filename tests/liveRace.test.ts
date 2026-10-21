@@ -10,6 +10,7 @@ import {
 } from "../src/engine/season";
 import { LiveRace } from "../src/engine/liveRace";
 import { replayLiveRaceAudit } from "../src/engine/liveAudit";
+import { getCircuitProfile } from "../src/engine/trackProfile";
 
 const SETTINGS: CareerSettings = {
   aiDifficulty: "normal",
@@ -131,6 +132,94 @@ describe("interactive live race", () => {
     expect(snap.cars.every((c) => c.trackProgress >= 0 && c.trackProgress <= 1)).toBe(true);
     expect(snap.cars.every((c) => Number.isFinite(c.elevationMetres))).toBe(true);
     expect(snap.cars.map((c) => c.position)).toEqual(snap.cars.map((_, i) => i + 1));
+  });
+
+  it("builds a real speed profile with straights, braking zones and corner direction", () => {
+    const { bundle } = playerBundle();
+    const prep = prepareRace(bundle);
+    const profile = getCircuitProfile(prep.circuit);
+    const speeds = Array.from({ length: 240 }, (_, i) => profile.speedAt(i / 240));
+    expect(Math.max(...speeds) - Math.min(...speeds)).toBeGreaterThan(0.25);
+
+    let left = 0;
+    let right = 0;
+    for (let i = 0; i < 240; i++) {
+      const d = profile.directionAt(i / 240);
+      if (d < 0) left++;
+      if (d > 0) right++;
+    }
+    expect(left).toBeGreaterThan(0);
+    expect(right).toBeGreaterThan(0);
+  });
+
+  it("projects different corner techniques, not just a constant tow", () => {
+    const { bundle, teamId } = playerBundle();
+    const { engine } = makeEngine(bundle, teamId);
+    engine.step();
+    engine.step();
+
+    const modes = new Set<string>();
+    for (let i = 1; i < 100; i++) {
+      for (const c of engine.broadcastSnapshot(i / 100).cars) modes.add(c.overtakeMode);
+    }
+    expect(modes.has("slipstream")).toBe(true);
+    expect(modes.has("dive")).toBe(true);
+    expect(modes.has("outside")).toBe(true);
+    expect(modes.has("switchback")).toBe(true);
+    expect(modes.has("defend")).toBe(true);
+  });
+
+  it("animates a pit entry, stationary stop and pit exit", () => {
+    const { bundle, teamId } = playerBundle();
+    const { engine, controlled } = makeEngine(bundle, teamId);
+    const me = controlled[0];
+    engine.step();
+    engine.setCommand(me, { pitRequest: true, pitCompound: "hard" });
+
+    const stop = engine.broadcastSnapshot(0.999).cars.find((c) => c.driverId === me);
+    expect(stop?.pitPhase).toBe("stop");
+
+    engine.step();
+
+    const exit = engine.broadcastSnapshot(0.02).cars.find((c) => c.driverId === me);
+    expect(exit?.pitPhase).toBe("exit");
+    expect(exit?.pitProgress).toBeGreaterThan(0);
+    expect(exit?.lastPitStopSeconds).toBeGreaterThan(1);
+  });
+
+  it("lines the field up in qualifying order before the start", () => {
+    const { bundle, teamId } = playerBundle();
+    const prep = prepareRace(bundle);
+    const { engine } = makeEngine(bundle, teamId);
+
+    const snap = engine.broadcastSnapshot(0);
+    const expected = [...prep.entrants]
+      .sort((a, b) => a.gridPosition - b.gridPosition)
+      .map((e) => e.driverId);
+    expect(snap.cars.map((c) => c.driverId)).toEqual(expected);
+    expect(snap.cars[0].driverId).toBe(prep.poleDriverId);
+    expect(new Set(snap.cars.map((c) => c.trackProgress.toFixed(3))).size).toBe(snap.cars.length);
+    expect(snap.cars[1].gapAhead).toBeGreaterThan(0);
+  });
+
+  it("suspends the race clock for a red flag and restarts from the grid", () => {
+    const { bundle, teamId } = playerBundle();
+    const { engine } = makeEngine(bundle, teamId);
+    engine.step();
+    const lap = engine.lap;
+    const laps = engine.laps.length;
+
+    engine.flag = "red-flag";
+    (engine as unknown as { neutralisedLaps: number }).neutralisedLaps = 2;
+    engine.step();
+    expect(engine.lap).toBe(lap);
+    expect(engine.laps).toHaveLength(laps);
+    expect(engine.flag).toBe("red-flag");
+
+    const events = engine.resumeFromRedFlag();
+    expect(engine.flag).toBe("green");
+    expect(engine.lap).toBe(lap);
+    expect(events.some((e) => e.kind === "flag")).toBe(true);
   });
 
   it("applies fuel and ERS commands to the broadcast and the next lap", () => {

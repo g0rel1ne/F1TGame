@@ -1,5 +1,6 @@
 import { memo, useMemo } from "react";
 import type { Circuit } from "../engine/types";
+import type { OvertakeMode } from "../engine/liveRace";
 import { CarSvg, type CarPaint, type CarStyle } from "./CarSvg";
 import { getTrack, type Pt } from "../lib/trackGeometry";
 
@@ -16,6 +17,13 @@ export interface RaceTrackCar {
   lane?: number;
   /** 0..1 of the car's flat-out speed, used for motion blur and brake lights. */
   speed?: number;
+  /** 0..1 brake force, for brake-light intensity. */
+  brake?: number;
+  /** 0..1 throttle opening out of the corner. */
+  throttle?: number;
+  /** 0..1 dirty-air tow behind the car ahead. */
+  tow?: number;
+  overtakeMode?: OvertakeMode;
   braking?: boolean;
   drs?: boolean;
   blueFlag?: boolean;
@@ -37,6 +45,23 @@ const W = 400;
 const H = 240;
 const ROAD = 10;
 const PAD = 16;
+const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+const BATTLE_LABEL: Record<OvertakeMode, string> = {
+  none: "",
+  slipstream: "TOW",
+  dive: "DIVE",
+  outside: "OUTSIDE",
+  switchback: "SWITCH",
+  defend: "DEFEND",
+};
+const BATTLE_COLOR: Record<OvertakeMode, string> = {
+  none: "#94a3b8",
+  slipstream: "#38bdf8",
+  dive: "#f59e0b",
+  outside: "#a78bfa",
+  switchback: "#34d399",
+  defend: "#f87171",
+};
 
 export function RaceTrack({
   circuit,
@@ -98,13 +123,19 @@ export function RaceTrack({
     () =>
       cars.map((c) => {
         const inPit = c.pitPhase ? c.pitPhase !== "none" : c.pit && (c.progress > 0.9 || c.progress < 0.12);
+        // Ease between the racing line and pit lane instead of teleporting.
+        const pitBlend = inPit
+          ? c.pitPhase === "stop" ? 1 : c.pitPhase === "entry" || c.pitPhase === "exit" ? clamp01(c.pitProgress ?? 1) : 1
+          : 0;
+        // The car is stationary while the crew works on it.
+        const displayProgress = c.pitPhase === "stop" ? 0.972 : c.progress;
         // All cars run the racing line; traffic adds a small side-by-side shift.
-        const racing = geo.racingOffsetAt(c.progress);
+        const racing = geo.racingOffsetAt(displayProgress);
         const lateral = inPit
-          ? pit.side * pit.offset
+          ? pit.side * pit.offset * pitBlend
           : Math.max(-maxLateral, Math.min(maxLateral, racing + (c.lane ?? 0)));
-        const p = geo.offsetAt(c.progress, lateral);
-        const deg = (geo.angleAt(c.progress) * 180) / Math.PI;
+        const p = geo.offsetAt(displayProgress, lateral);
+        const deg = (geo.angleAt(displayProgress) * 180) / Math.PI;
         return { car: c, p, deg };
       }),
     [cars, geo, pit, maxLateral],
@@ -227,8 +258,16 @@ export function RaceTrack({
         const lift = Math.max(0, Math.min(1, ((car.elevationMetres ?? 0) + 30) / 60));
         const contact = car.contact ?? 0;
         const damage = car.damage ?? 0;
+        const brake = Math.max(car.braking ? 0.55 : 0, car.brake ?? 0);
+        const tow = car.tow ?? 0;
         return (
           <g key={car.id} transform={`translate(${p.x.toFixed(2)} ${p.y.toFixed(2)}) rotate(${deg.toFixed(1)})`}>
+            {tow > 0.3 && (
+              <g stroke="#dbeafe" strokeWidth={0.18} strokeLinecap="round" opacity={Math.min(0.5, (tow - 0.3) * 0.9)}>
+                <line x1={-carLen * 0.5} y1={-carW * 0.28} x2={-carLen * (0.95 + tow * 0.35)} y2={-carW * 0.28} />
+                <line x1={-carLen * 0.5} y1={carW * 0.28} x2={-carLen * (0.95 + tow * 0.35)} y2={carW * 0.28} />
+              </g>
+            )}
             <ellipse
               cx={(lift - 0.5) * 2.4}
               cy={(lift - 0.5) * 1.6}
@@ -240,10 +279,10 @@ export function RaceTrack({
             {car.highlight && <ellipse rx={carLen * 0.55} ry={carW * 1.0} fill="none" stroke={car.color} strokeWidth="0.45" opacity="0.9" />}
             {car.blueFlag && <ellipse rx={carLen * 0.62} ry={carW * 1.12} fill="none" stroke="#3b82f6" strokeWidth="0.5" opacity="0.95" />}
             <Car paint={car.paint} style={car.style} width={carLen} height={carW} x={-carLen / 2} y={-carW / 2} />
-            {car.braking && (
-              <g fill="#ff2a2a">
-                <circle cx={-carLen * 0.43} cy={-carW * 0.28} r={carW * 0.07} />
-                <circle cx={-carLen * 0.43} cy={carW * 0.28} r={carW * 0.07} />
+            {brake > 0.08 && (
+              <g fill="#ff2a2a" opacity={Math.min(1, 0.45 + brake * 0.75)}>
+                <circle cx={-carLen * 0.43} cy={-carW * 0.28} r={carW * (0.06 + brake * 0.035)} />
+                <circle cx={-carLen * 0.43} cy={carW * 0.28} r={carW * (0.06 + brake * 0.035)} />
               </g>
             )}
             {car.drs && <rect x={-carLen * 0.49} y={-carW * 0.2} width={carLen * 0.05} height={carW * 0.4} fill="#22d3ee" opacity="0.95" />}
@@ -290,6 +329,30 @@ export function RaceTrack({
           </text>
         ) : null,
       )}
+
+      {/* Overtake technique callouts (upright) */}
+      {placed.map(({ car, p }) => {
+        const mode = car.overtakeMode && car.overtakeMode !== "none" ? car.overtakeMode : null;
+        if (!mode) return null;
+        return (
+          <text
+            key={`battle-${car.id}`}
+            x={p.x}
+            y={p.y - carW - 3.5}
+            fontSize="1.8"
+            fill={BATTLE_COLOR[mode]}
+            stroke="#0a0b0e"
+            strokeWidth="0.8"
+            paintOrder="stroke"
+            fontFamily="Rajdhani, sans-serif"
+            fontWeight="700"
+            letterSpacing="0.25"
+            textAnchor="middle"
+          >
+            {BATTLE_LABEL[mode]}
+          </text>
+        );
+      })}
     </svg>
   );
 }

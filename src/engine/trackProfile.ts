@@ -27,6 +27,8 @@ export interface CircuitProfile {
   elevationAt(progress: number): number;
   /** 1-based corner number at this point, if the point is a recognised apex. */
   cornerAt(progress: number): number | null;
+  /** Signed corner direction: +1 / -1, or 0 on a straight. */
+  directionAt(progress: number): -1 | 0 | 1;
   /** Elevation change across the lap in metres. */
   elevationRange: number;
   /** Highest point as normalised progress. */
@@ -152,21 +154,25 @@ export function buildCircuitProfile(circuit: Circuit): CircuitProfile {
   const progress = cum.map((d) => d / total);
 
   const k = movingAverage(curvature(points), 4);
+  const direction = k.map((kk) => (Math.abs(kk) < 0.004 ? 0 : kk > 0 ? 1 : -1) as -1 | 0 | 1);
   const speed = k.map((kk) => clamp(1 / Math.sqrt(1 + (Math.abs(kk) / 0.055) ** 2), 0.28, 1));
 
   // Brake before corners and accelerate out, exactly like a driver would.
-  const ds = progress.map((p, i) => Math.max(0.0005, (i === 0 ? 1 + p - progress[n - 1] : p - progress[i - 1]) * total));
-  for (let pass = 0; pass < 2; pass++) {
+  // Distances are in metres so the speed profile can actually build and shed
+  // speed over a braking zone instead of collapsing to the minimum everywhere.
+  const metres = Math.max(1, circuit.lengthKm * 1000);
+  const ds = progress.map((p, i) => Math.max(0.5, (i === 0 ? 1 + p - progress[n - 1] : p - progress[i - 1]) * metres));
+  for (let pass = 0; pass < 3; pass++) {
     for (let i = n - 1; i >= 0; i--) {
       const next = speed[(i + 1) % n];
-      speed[i] = Math.min(speed[i], Math.sqrt(next * next + 2 * 0.018 * ds[i]));
+      speed[i] = Math.min(speed[i], Math.sqrt(next * next + 2 * 0.0055 * ds[i]));
     }
   }
-  for (let pass = 0; pass < 2; pass++) {
+  for (let pass = 0; pass < 3; pass++) {
     for (let i = 1; i < n; i++) {
-      speed[i] = Math.min(speed[i], Math.sqrt(speed[i - 1] ** 2 + 2 * 0.012 * ds[i]));
+      speed[i] = Math.min(speed[i], Math.sqrt(speed[i - 1] ** 2 + 2 * 0.0022 * ds[i]));
     }
-    speed[0] = Math.min(speed[0], Math.sqrt(speed[n - 1] ** 2 + 2 * 0.012 * ds[0]));
+    speed[0] = Math.min(speed[0], Math.sqrt(speed[n - 1] ** 2 + 2 * 0.0022 * ds[0]));
   }
 
   const times = new Array<number>(n).fill(0);
@@ -237,6 +243,11 @@ export function buildCircuitProfile(circuit: Circuit): CircuitProfile {
     return corners[i] ?? null;
   };
 
+  const directionAt = (p: number): -1 | 0 | 1 => {
+    const { i } = indexAt(p);
+    return direction[i] ?? 0;
+  };
+
   return {
     points: points.map((v, i) => ({
       x: v.x,
@@ -251,6 +262,7 @@ export function buildCircuitProfile(circuit: Circuit): CircuitProfile {
     speedAt,
     elevationAt,
     cornerAt,
+    directionAt,
     elevationRange,
     elevationPeak: progress[peakIndex],
     elevationTrough: progress[troughIndex],
