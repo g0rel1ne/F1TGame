@@ -6,12 +6,14 @@ import { Badge, Panel } from "../components/ui";
 import { TrackMap, type TrackMarker } from "./TrackMap";
 import { RaceTrack, type RaceTrackCar } from "./RaceTrack";
 import { paintFromTeam, stylesFromTeam, DEFAULT_PAINT, DEFAULT_STYLE, type CarPaint, type CarStyle } from "./CarSvg";
-import { getTrack } from "../lib/trackGeometry";
-import { LiveRace, type DriverCommand, type LiveEvent, type LiveSnapshot, type Pace } from "../engine/liveRace";
+import { LiveRace, sanitizeDriverCommand, type DriverCommand, type ErsMode, type FuelMode, type LiveEvent, type LiveRaceAudit, type LiveSnapshot, type Pace } from "../engine/liveRace";
 import { prepareRace, type CareerBundle } from "../engine/season";
+import { liveControlledDriverIds } from "../engine/liveAudit";
 import {
+  LIVE_SPEEDS,
   baseLapSeconds,
   emptyVotes,
+  isLiveSpeed,
   lapMsFor,
   majorityNeed,
   resolveSkip,
@@ -19,6 +21,7 @@ import {
   speedTally,
   type LiveBeat,
   type LiveMessage,
+  type LiveSessionInfo,
   type LiveSpeed,
   type LiveVotes,
 } from "../engine/liveSession";
@@ -30,6 +33,7 @@ import { lapTime } from "../lib/format";
 const COMPOUND_COLOR: Record<Compound, string> = { soft: "#f87171", medium: "#fbbf24", hard: "#e5e7eb", intermediate: "#34d399", wet: "#38bdf8" };
 const COMPOUND_LABEL: Record<Compound, string> = { soft: "Soft", medium: "Medium", hard: "Hard", intermediate: "Inter", wet: "Wet" };
 const ALL_COMPOUNDS: Compound[] = ["soft", "medium", "hard", "intermediate", "wet"];
+const START_LIGHT_MS = 4200;
 const FLAG_COLOR: Record<string, string> = { green: "#34d399", yellow: "#fbbf24", "safety-car": "#fbbf24", "virtual-safety-car": "#fbbf24", "red-flag": "#f87171", chequered: "#e5e7eb" };
 const PACE_META: Record<Pace, { label: string; tone: string; hint: string }> = {
   conserve: { label: "Manage", tone: "text-amber-300", hint: "Save tyres & fuel" },
@@ -47,6 +51,7 @@ export interface LiveRaceOnline {
   transport: LiveTransport;
   userId: string;
   isHost: boolean;
+  hostUserId: string | null;
   peers: LiveRacePeer[];
 }
 
@@ -59,7 +64,7 @@ export function LiveRaceView({
 }: {
   bundle: CareerBundle;
   myTeamId: string | null;
-  onFinish: (result: RaceResult) => Promise<void> | void;
+  onFinish: (result: RaceResult, audit?: LiveRaceAudit) => Promise<void> | void;
   onAbort: () => void;
   online?: LiveRaceOnline | null;
 }) {
@@ -70,20 +75,21 @@ export function LiveRaceView({
   const mineIds = useMemo(() => new Set(myDrivers.map((d) => d.id)), [myDrivers]);
   // Every principal's cars are "controlled" so remote radio commands are accepted;
   // the wire still checks that a sender only ever commands their own team.
-  const playerDriverIds = useMemo(
-    () =>
-      bundle.drivers
-        .filter((d) => d.teamId && bundle.teams.find((t) => t.id === d.teamId)?.ownerUserId)
-        .map((d) => d.id),
-    [bundle.drivers, bundle.teams],
-  );
+  const playerDriverIds = useMemo(() => liveControlledDriverIds(bundle), [bundle]);
   const memberIds = useMemo(() => (online ? online.peers.filter((p) => p.online).map((p) => p.userId) : []), [online]);
+  const sessionIdRef = useRef<string>(
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `live-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+  );
+  const sessionStartedAtRef = useRef(Date.now());
 
   const engineRef = useRef<LiveRace | null>(null);
   if (isHost && !engineRef.current) {
     const prep = prepareRace(bundle);
     engineRef.current = new LiveRace({
       raceId: prep.raceId,
+      sessionId: sessionIdRef.current,
       seed: prep.seed,
       circuit: prep.circuit,
       totalLaps: prep.totalLaps,
@@ -97,8 +103,24 @@ export function LiveRaceView({
     });
   }
   const engine = engineRef.current;
+  const sessionInfo = useMemo<LiveSessionInfo | null>(
+    () =>
+      engine && online
+        ? {
+            sessionId: engine.sessionId,
+            raceId: engine.raceId,
+            hostUserId: online.userId,
+            circuitId: circuit.id,
+            totalLaps: engine.totalLaps,
+            startedAt: sessionStartedAtRef.current,
+          }
+        : null,
+    [engine, online, circuit.id],
+  );
 
   const [tick, setTick] = useState(0);
+  const [clock, setClock] = useState(() => Date.now());
+  const [remoteStart, setRemoteStart] = useState<number | null>(null);
   const [progress, setProgress] = useState(0);
   const [paused, setPaused] = useState(false);
   const [speed, setSpeed] = useState<LiveSpeed>(1);
@@ -137,13 +159,22 @@ export function LiveRaceView({
 
   const totalLaps = engine ? engine.totalLaps : Math.max(5, Math.round(circuit.laps * (bundle.settings.raceDistancePct / 100)));
   const emptySnapshot: LiveSnapshot = useMemo(
-    () => ({ lap: 0, totalLaps, flag: "green", weather: bundle.weekend.weather, cars: [], finished: false }),
+    () => ({
+      lap: 0,
+      totalLaps,
+      flag: "green",
+      weather: bundle.weekend.weather,
+      cars: [],
+      finished: false,
+      safetyCarProgress: null,
+      lapFraction: 0,
+    }),
     [totalLaps, bundle.weekend.weather],
   );
 
   const snapshot: LiveSnapshot = useMemo(
-    () => (engine ? engine.snapshot() : beat ? beat.snapshot : emptySnapshot),
-    [engine, beat, emptySnapshot, tick],
+    () => (engine ? engine.broadcastSnapshot(progress) : beat ? beat.snapshot : emptySnapshot),
+    [engine, beat, emptySnapshot, tick, progress],
   );
 
   const events: LiveEvent[] = useMemo(() => (engine ? engine.events : beatEvents), [engine, beatEvents, tick]);
@@ -153,6 +184,20 @@ export function LiveRaceView({
   const liveVotes = isHost ? votes : (beat?.votes ?? emptyVotes());
   const showWaitingOverlay = !!online && !online.isHost && waiting;
 
+  useEffect(() => {
+    const id = window.setInterval(() => setClock(Date.now()), 100);
+    const stop = window.setTimeout(() => window.clearInterval(id), START_LIGHT_MS + 2000);
+    return () => {
+      window.clearInterval(id);
+      window.clearTimeout(stop);
+    };
+  }, []);
+
+  const startAt = isHost ? sessionStartedAtRef.current : remoteStart ?? beat?.at ?? sessionStartedAtRef.current;
+  const startElapsed = clock - startAt;
+  const startLightsLit = startElapsed < 600 ? 0 : Math.min(5, Math.floor((startElapsed - 600) / 520) + 1);
+  const showStartLights = !finished && snapshot.lap === 0 && startElapsed < START_LIGHT_MS + 900;
+
   const send = useCallback(
     (message: LiveMessage) => {
       online?.transport.send(message);
@@ -160,7 +205,7 @@ export function LiveRaceView({
     [online],
   );
 
-  /** The host streams one beat per simulated lap; guests render them as-is. */
+  /** The host streams sub-lap broadcast frames; guests render them as-is. */
   const publish = useCallback(() => {
     if (!engine || !online || !online.isHost) return;
     const grew = engine.events.slice(sentEventsRef.current);
@@ -170,7 +215,8 @@ export function LiveRaceView({
       t: "beat",
       beat: {
         seq: seqRef.current,
-        snapshot: engine.snapshot(),
+        sessionId: engine.sessionId,
+        snapshot: engine.broadcastSnapshot(progRef.current),
         events: grew,
         speed: speedRef.current,
         paused: pausedRef.current,
@@ -182,22 +228,27 @@ export function LiveRaceView({
   }, [engine, online, send, circuit.referenceLapSeconds]);
   publishRef.current = publish;
 
-  // Kick the race off: the host announces the start so guests' screens open on
-  // the live view before the first lap completes. A guest asks for the current
-  // state straight away so it does not have to wait a whole lap for a beat.
+  // Kick the race off: the host announces the start more than once (broadcast
+  // messages are fire-and-forget and a tab may still be subscribing), then
+  // publishes the opening snapshot. A guest asks for the current state straight
+  // away so it does not have to wait a whole lap for a beat.
   useEffect(() => {
     if (!online) return;
     if (online.isHost) {
-      if (engine && !startedRef.current) {
+      if (engine && sessionInfo && !startedRef.current) {
         startedRef.current = true;
-        send({ t: "start" });
+        const announce = () => send({ t: "start", session: sessionInfo });
+        announce();
+        publishRef.current();
+        const retries = [500, 1500, 3500].map((ms) => window.setTimeout(announce, ms));
+        return () => retries.forEach((id) => window.clearTimeout(id));
       }
       return;
     }
     if (askedRef.current) return;
     askedRef.current = true;
     send({ t: "sync" });
-  }, [engine, online, send]);
+  }, [engine, online, send, sessionInfo]);
 
   // ---- host simulation loop ----
   useEffect(() => {
@@ -205,10 +256,20 @@ export function LiveRaceView({
     if (paused || done) return;
     let raf = 0;
     let last = performance.now();
+    let lastPublish = 0;
     const loop = (now: number) => {
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
       if (pausedRef.current) {
+        raf = requestAnimationFrame(loop);
+        return;
+      }
+      if (Date.now() - sessionStartedAtRef.current < START_LIGHT_MS) {
+        setProgress(0);
+        if (now - lastPublish > 100) {
+          lastPublish = now;
+          publishRef.current();
+        }
         raf = requestAnimationFrame(loop);
         return;
       }
@@ -226,8 +287,9 @@ export function LiveRaceView({
         publishRef.current();
         return;
       }
-      if (stepped) {
-        setTick((t) => t + 1);
+      if (stepped || now - lastPublish > 100) {
+        if (stepped) setTick((t) => t + 1);
+        lastPublish = now;
         publishRef.current();
       }
       setProgress(progRef.current);
@@ -265,26 +327,31 @@ export function LiveRaceView({
           const driver = bundle.drivers.find((d) => d.id === message.driverId);
           const sender = online.peers.find((p) => p.userId === from);
           if (!driver || !sender || !sender.teamId || sender.teamId !== driver.teamId) return;
-          const patch = sanitizeCommand(message.patch);
+          const patch = sanitizeDriverCommand(message.patch);
           if (Object.keys(patch).length === 0) return;
           engine?.setCommand(message.driverId, patch);
           setTick((t) => t + 1);
           publishRef.current();
         } else if (message.t === "sync") {
-          // Someone just joined (or came back): push them the current state.
+          // Someone just joined (or came back): identify the session and push
+          // the current state immediately. This is also the reconnect path.
+          if (sessionInfo) send({ t: "start", session: sessionInfo });
           publishRef.current();
         } else if (message.t === "vote") {
           setVotes((prev) => {
             const next: LiveVotes = { speed: { ...prev.speed }, skip: [...prev.skip] };
-            if (message.speed) next.speed[from] = message.speed;
+            if (isLiveSpeed(message.speed)) next.speed[from] = message.speed;
             if (message.skip && !next.skip.includes(from)) next.skip.push(from);
             return next;
           });
         }
         return;
       }
+      // Only the lobby host may drive the shared race.
+      if (online.hostUserId && from !== online.hostUserId) return;
       if (message.t === "start") {
         setWaiting(false);
+        setRemoteStart(message.session.startedAt);
       } else if (message.t === "beat") {
         setWaiting(false);
         setBeat((prev) => (!prev || message.beat.seq > prev.seq ? message.beat : prev));
@@ -301,7 +368,7 @@ export function LiveRaceView({
         onAbortRef.current();
       }
     });
-  }, [online, engine, bundle.drivers]);
+  }, [online, engine, bundle.drivers, sessionInfo, send]);
 
   // Keep guests in step when the host pauses or changes speed between laps.
   useEffect(() => {
@@ -309,17 +376,54 @@ export function LiveRaceView({
     publishRef.current();
   }, [paused, speed, online]);
 
-  // A guest that hears nothing for a long time should say so rather than spin.
+  // A guest that hears nothing for a long time asks for the current state again.
+  // This recovers from a missed start, a backgrounded tab or a network gap.
   useEffect(() => {
     if (isHost || !online) return;
-    const timer = setInterval(() => {
+    let lastSync = 0;
+    const recover = (force = false) => {
       const current = beatRef.current;
-      if (!current) return;
-      const silence = Date.now() - current.at;
-      setWaiting(silence > Math.max(6000, current.lapMs * 8));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [isHost, online]);
+      const silence = current ? Date.now() - current.at : Infinity;
+      const stale = !current || silence > Math.max(5000, current.lapMs * 4);
+      setWaiting(stale);
+      if ((stale || force) && Date.now() - lastSync > 3500) {
+        lastSync = Date.now();
+        send({ t: "sync", sessionId: current?.sessionId });
+      }
+    };
+    const timer = setInterval(() => recover(), 1000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") recover(true);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    recover();
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+  }, [isHost, online, send]);
+
+  // Hand disconnected principals' cars to the AI while they are away, and give
+  // control back automatically when they reconnect.
+  useEffect(() => {
+    if (!engine || !online || !online.isHost) return;
+    const connected = new Set(online.peers.filter((p) => p.online).map((p) => p.userId));
+    let changed = false;
+    for (const team of bundle.teams) {
+      if (!team.ownerUserId) continue;
+      const mode = connected.has(team.ownerUserId) ? "human" : "ai";
+      for (const driver of bundle.drivers) {
+        if (driver.teamId !== team.id) continue;
+        if (engine.setControlMode(driver.id, mode)) changed = true;
+      }
+    }
+    if (changed) {
+      setTick((t) => t + 1);
+      publishRef.current();
+    }
+  }, [engine, online, bundle.teams, bundle.drivers]);
 
   // Host applies a majority vote.
   useEffect(() => {
@@ -337,31 +441,22 @@ export function LiveRaceView({
     }
   }, [votes, online, memberIds]);
 
-  const effProgress = finished ? 1 : progress;
-
-  // Shared geometry drives both the car view and the dots view. Its speed
-  // profile lets us place cars by time: they visibly brake for corners and
-  // accelerate out while the lap time stays authoritative.
-  const geo = useMemo(() => getTrack(circuit, 400, 240, 16, 10), [circuit]);
-  const lapLength = circuit.referenceLapSeconds || 90;
-
   const markers: TrackMarker[] = useMemo(() => {
     const cars = snapshot.cars.filter((c) => !c.retired);
     return cars.map((c) => {
       const d = bundle.drivers.find((x) => x.id === c.driverId);
       const t = bundle.teams.find((x) => x.id === c.teamId);
-      const gapFraction = c.gapToLeader > 0 ? (c.gapToLeader / lapLength) % 1 : 0;
-      const p = geo.progressAtTime(effProgress - gapFraction);
       const mine = mineIds.has(c.driverId);
       return {
         id: c.driverId,
-        progress: p,
+        progress: c.trackProgress,
         color: t?.colors.primary ?? "#888",
         label: mine || c.position <= 3 ? d?.code : undefined,
         highlight: mine || c.position === 1,
+        blue: c.blueFlag,
       };
     });
-  }, [snapshot.cars, effProgress, bundle.drivers, bundle.teams, mineIds, geo, lapLength]);
+  }, [snapshot.cars, bundle.drivers, bundle.teams, mineIds]);
 
   /** On-screen progress of the leading car you control — used to lock the camera.
    *  If you field no cars (or have none running), follow the race leader instead. */
@@ -393,8 +488,6 @@ export function LiveRaceView({
       .map((c) => {
         const d = bundle.drivers.find((x) => x.id === c.driverId);
         const t = bundle.teams.find((x) => x.id === c.teamId);
-        const gapFraction = c.gapToLeader > 0 ? (c.gapToLeader / lapLength) % 1 : 0;
-        const p = geo.progressAtTime(effProgress - gapFraction);
         const mine = mineIds.has(c.driverId);
         // Traffic awareness: when running close to the car ahead, pull off the
         // racing line into a side-by-side lane instead of driving through it.
@@ -402,7 +495,7 @@ export function LiveRaceView({
         const lane = close ? (c.position % 2 === 0 ? -1 : 1) * 1.15 * (1 - (c.gapAhead as number) / 1.1) : 0;
         return {
           id: c.driverId,
-          progress: p,
+          progress: c.trackProgress,
           color: t?.colors.primary ?? "#888",
           paint: teamPaint.get(c.teamId) ?? DEFAULT_PAINT,
           style: teamStyle.get(c.teamId) ?? DEFAULT_STYLE,
@@ -410,9 +503,18 @@ export function LiveRaceView({
           highlight: mine || c.position === 1,
           pit: !!c.pit,
           lane,
+          speed: c.speed,
+          braking: c.braking,
+          drs: c.drs,
+          blueFlag: c.blueFlag,
+          pitPhase: c.pitPhase,
+          pitProgress: c.pitProgress,
+          contact: c.contact,
+          damage: c.damagePct,
+          elevationMetres: c.elevationMetres,
         };
       });
-  }, [snapshot.cars, effProgress, geo, lapLength, bundle.drivers, bundle.teams, mineIds, teamPaint, teamStyle]);
+  }, [snapshot.cars, bundle.drivers, bundle.teams, mineIds, teamPaint, teamStyle]);
 
   useEffect(() => {
     localStorage.setItem("f1team.trackView", viewMode);
@@ -426,8 +528,8 @@ export function LiveRaceView({
     setCommitting(true);
     try {
       const out = engine.finalize();
+      await onFinish(out.result, out.audit);
       send({ t: "end", result: out.result });
-      await onFinish(out.result);
     } finally {
       setCommitting(false);
     }
@@ -473,6 +575,8 @@ export function LiveRaceView({
 
   const setCommand = (driverId: string, patch: Partial<DriverCommand>) => {
     if (!mineIds.has(driverId)) return;
+    const car = snapshot.cars.find((c) => c.driverId === driverId);
+    if (!car || car.controlMode === "ai") return;
     if (isHost) {
       engine?.setCommand(driverId, patch);
       setTick((t) => t + 1);
@@ -493,7 +597,7 @@ export function LiveRaceView({
   const winnerDriver = winning ? bundle.drivers.find((d) => d.id === winning.driverId) : undefined;
 
   const abandon = () => {
-    if (isHost && online) send({ t: "abort" });
+    if (isHost && online) send({ t: "abort", sessionId: engine?.sessionId ?? beat?.sessionId });
     onAbort();
   };
 
@@ -531,9 +635,47 @@ export function LiveRaceView({
                 height={280}
                 className="w-full"
                 camera={lockCamera ? { progress: focusProgress, zoom: 5.2 } : undefined}
+                safetyCarProgress={snapshot.safetyCarProgress}
               />
             ) : (
               <TrackMap circuit={circuit} markers={markers} height={280} className="w-full" />
+            )}
+            {showStartLights && (
+              <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center bg-black/35 backdrop-blur-[1px]">
+                <div className="rounded-2xl border border-white/10 bg-carbon-950/90 px-6 py-4 text-center shadow-2xl">
+                  <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.3em] text-gray-400">Start procedure</div>
+                  <div className="flex items-center gap-2.5">
+                    {Array.from({ length: 5 }, (_, i) => (
+                      <span
+                        key={i}
+                        className={`h-5 w-5 rounded-full border transition-all ${
+                          startElapsed >= START_LIGHT_MS
+                            ? "border-emerald-300/60 bg-emerald-400 shadow-[0_0_18px_rgba(52,211,153,0.9)]"
+                            : i < startLightsLit
+                              ? "border-red-300/60 bg-red-500 shadow-[0_0_18px_rgba(239,68,68,0.9)]"
+                              : "border-carbon-600 bg-carbon-800"
+                        }`}
+                      />
+                    ))}
+                  </div>
+                  <div className={`mt-2 text-xs font-semibold uppercase tracking-wider ${startElapsed >= START_LIGHT_MS ? "text-emerald-300" : "text-gray-300"}`}>
+                    {startElapsed >= START_LIGHT_MS ? "Lights out — go!" : "Formation complete"}
+                  </div>
+                </div>
+              </div>
+            )}
+            {flag === "red-flag" && (
+              <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center bg-red-950/45">
+                <div className="rounded-xl border border-red-400/40 bg-red-950/90 px-5 py-3 text-center">
+                  <div className="text-sm font-bold uppercase tracking-[0.25em] text-red-300">Red flag</div>
+                  <div className="mt-1 text-[11px] text-red-200/80">Session stopped — field holds on the grid</div>
+                </div>
+              </div>
+            )}
+            {(flag === "safety-car" || flag === "virtual-safety-car") && (
+              <div className="pointer-events-none absolute left-1/2 top-4 z-10 -translate-x-1/2 rounded-full border border-amber-400/40 bg-amber-950/80 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.22em] text-amber-300 backdrop-blur">
+                {flag === "safety-car" ? "Safety car" : "Virtual safety car"}
+              </div>
             )}
             <div className="absolute bottom-3 left-4 z-10">
               <button
@@ -575,7 +717,7 @@ export function LiveRaceView({
               {(isHost ? paused : viewPaused) ? <Play size={15} /> : <Pause size={15} />} {(isHost ? paused : viewPaused) ? "Resume" : "Pause"}
             </button>
             <div className="flex overflow-hidden rounded-lg border border-carbon-700">
-              {([1, 2, 4] as LiveSpeed[]).map((s) => (
+              {LIVE_SPEEDS.map((s) => (
                 <button
                   key={s}
                   onClick={() => (isHost ? setSpeedDirect(s) : castSpeedVote(s))}
@@ -675,6 +817,11 @@ export function LiveRaceView({
                       </div>
                       {c.retired ? (
                         <div className="flex items-center gap-1.5 text-xs text-red-400"><AlertTriangle size={12} /> Out of the race.</div>
+                      ) : c.controlMode === "ai" ? (
+                        <div className="flex items-start gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] text-amber-300">
+                          <Wifi size={12} className="mt-0.5 shrink-0" />
+                          AI takeover — your team is still racing. Controls return automatically when you reconnect.
+                        </div>
                       ) : (
                         <>
                           <div className="mb-1.5 flex gap-1">
@@ -688,6 +835,40 @@ export function LiveRaceView({
                                 {PACE_META[p].label}
                               </button>
                             ))}
+                          </div>
+                          <div className="mb-1.5 grid grid-cols-2 gap-1.5">
+                            <div className="flex items-center gap-1">
+                              <span className="w-7 text-[9px] font-semibold uppercase tracking-wider text-gray-500">ERS</span>
+                              {(["off", "medium", "high"] as ErsMode[]).map((m) => {
+                                const value = patch.ers ?? c.ers;
+                                return (
+                                  <button
+                                    key={m}
+                                    onClick={() => setCommand(c.driverId, { ers: m })}
+                                    className={`flex-1 rounded border px-1 py-0.5 text-[10px] font-semibold capitalize ${value === m ? "border-sky-400 bg-sky-400/15 text-sky-300" : "border-carbon-700 text-gray-500 hover:text-gray-300"}`}
+                                    title={`ERS ${m}`}
+                                  >
+                                    {m === "medium" ? "med" : m}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <span className="w-7 text-[9px] font-semibold uppercase tracking-wider text-gray-500">Fuel</span>
+                              {(["lean", "standard", "rich"] as FuelMode[]).map((m) => {
+                                const value = patch.fuelMode ?? c.fuelMode;
+                                return (
+                                  <button
+                                    key={m}
+                                    onClick={() => setCommand(c.driverId, { fuelMode: m })}
+                                    className={`flex-1 rounded border px-1 py-0.5 text-[10px] font-semibold capitalize ${value === m ? "border-amber-400 bg-amber-400/15 text-amber-300" : "border-carbon-700 text-gray-500 hover:text-gray-300"}`}
+                                    title={`Fuel ${m}`}
+                                  >
+                                    {m === "standard" ? "std" : m}
+                                  </button>
+                                );
+                              })}
+                            </div>
                           </div>
                           <div className="flex items-center gap-1.5">
                             {c.pit ? (
@@ -720,9 +901,16 @@ export function LiveRaceView({
                           <div className="mt-1.5 flex items-center justify-between text-[10px] text-gray-500">
                             <span className={specc.tone}>Pace: {specc.label}</span>
                             <span className="font-mono">
-                              {c.lastLapTime ? `Last ${lapTime(c.lastLapTime)}` : "—"}
+                              {c.lastLapTime ? `Last ${lapTime(c.lastLapTime)}` : "-"}
                               {c.gapAhead !== null && ` · Gap ${c.gapAhead.toFixed(1)}s`}
                             </span>
+                          </div>
+                          <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[9px] font-mono">
+                            <span className="rounded bg-carbon-900 px-1.5 py-0.5 text-sky-300">ERS {Math.round(c.ersCharge * 100)}%</span>
+                            <span className={`rounded bg-carbon-900 px-1.5 py-0.5 ${c.fuelLaps < 3 ? "text-red-300" : "text-amber-300"}`}>FUEL {c.fuelLaps.toFixed(1)}L</span>
+                            {c.drs && <span className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-cyan-300">DRS</span>}
+                            {c.blueFlag && <span className="rounded bg-blue-500/15 px-1.5 py-0.5 text-blue-300">BLUE FLAG</span>}
+                            {c.penaltyCount > 0 && <span className="rounded bg-red-500/15 px-1.5 py-0.5 text-red-300">+{c.penaltySeconds}s</span>}
                           </div>
                           {c.damagePct > 0.05 && (
                             <div className="mt-1 flex items-center gap-1 text-[10px] text-amber-400"><Gauge size={10} /> Damage {Math.round(c.damagePct * 100)}%</div>
@@ -790,15 +978,6 @@ export function LiveRaceView({
       </div>
     </Panel>
   );
-}
-
-/** Only a tiny, well-understood set of fields may be set remotely. */
-function sanitizeCommand(patch: Partial<DriverCommand>): Partial<DriverCommand> {
-  const out: Partial<DriverCommand> = {};
-  if (patch.pace === "conserve" || patch.pace === "normal" || patch.pace === "push") out.pace = patch.pace;
-  if (patch.pitCompound && ALL_COMPOUNDS.includes(patch.pitCompound)) out.pitCompound = patch.pitCompound;
-  if (typeof patch.pitRequest === "boolean") out.pitRequest = patch.pitRequest;
-  return out;
 }
 
 function FeedRow({ event, bundle }: { event: LiveEvent; bundle: CareerBundle }) {

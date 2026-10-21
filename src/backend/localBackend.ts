@@ -46,6 +46,8 @@ import {
 } from "../engine/development";
 import { makeTxn } from "../engine/finance";
 import { sanitizeSetup } from "../engine/car";
+import { replayLiveRaceAudit } from "../engine/liveAudit";
+import type { LiveRaceAudit } from "../engine/liveRace";
 import { negotiate } from "../engine/drivermarket";
 import type { ContractOffer } from "../engine/drivermarket";
 import { Rng } from "../engine/rng";
@@ -553,22 +555,23 @@ export class LocalBackend implements Backend {
       const existing = bundle.results.find((r) => r.id === bundle.weekend.resultId)!;
       return { bundle, result: existing };
     }
-    // Readiness: all active human players who own a team must be ready.
-    const required = lobby.members.filter((m) => m.online);
-    const ready = new Set(bundle.weekend.readyUserIds);
-    const notReady = required.filter((m) => !ready.has(m.userId));
-    if (notReady.length > 0) throw new Error(`Cannot start: ${notReady.map((m) => m.username).join(", ")} not ready.`);
+    // Readiness is advisory: the host may start without waiting for everyone.
     const res = runRaceWeekend(bundle);
     await this.save(lobbyId, res.bundle);
     return { bundle: res.bundle, result: res.result };
   }
 
   /**
-   * Commit a result produced by the interactive live race. The local client is
-   * the authority in offline mode, so we only sanity-check that every classified
-   * driver/team actually belongs to this career before processing it.
+   * Commit a result produced by the interactive live race. When the host sends
+   * the instruction audit, replay it through the same deterministic engine so
+   * the stored classification cannot be edited by hand.
    */
-  async commitRace(lobbyId: string, userId: string, result: RaceResult): Promise<{ bundle: CareerBundle; result: RaceResult }> {
+  async commitRace(
+    lobbyId: string,
+    userId: string,
+    result: RaceResult,
+    audit?: LiveRaceAudit,
+  ): Promise<{ bundle: CareerBundle; result: RaceResult }> {
     const lobby = await this.getLobby(lobbyId);
     if (!lobby) throw new Error("Lobby not found.");
     if (lobby.hostUserId !== userId) throw new Error("Only the host can submit the race result.");
@@ -578,19 +581,20 @@ export class LocalBackend implements Backend {
       if (existing) return { bundle, result: existing };
     }
 
+    const authoritative = audit ? replayLiveRaceAudit(bundle, audit).result : result;
     const driverIds = new Set(bundle.drivers.map((d) => d.id));
     const teamIds = new Set(bundle.teams.map((t) => t.id));
     const resultId = `${bundle.career.id}:s${bundle.season.number}:r${bundle.weekend.raceIndex}`;
     const safe: RaceResult = {
-      ...result,
+      ...authoritative,
       id: resultId,
       careerId: bundle.career.id,
       season: bundle.season.number,
       raceIndex: bundle.weekend.raceIndex,
       processed: false,
-      qualifying: result.qualifying ?? [],
-      classification: (result.classification ?? []).filter((c) => driverIds.has(c.driverId) && teamIds.has(c.teamId)),
-      laps: result.laps ?? [],
+      qualifying: authoritative.qualifying ?? [],
+      classification: (authoritative.classification ?? []).filter((c) => driverIds.has(c.driverId) && teamIds.has(c.teamId)),
+      laps: authoritative.laps ?? [],
     };
     if (safe.classification.length < 2) throw new Error("Race result is incomplete.");
 

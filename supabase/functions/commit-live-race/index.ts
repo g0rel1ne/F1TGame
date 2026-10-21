@@ -1,29 +1,30 @@
 import { handler, json, HttpError, readJson } from "../_shared/http.ts";
-import { loadCareer, loadLobby, loadMembers, requireHost, requireMember, requireUser, saveCareer } from "../_shared/db.ts";
+import { loadCareer, loadLobby, requireHost, requireMember, requireUser, saveCareer } from "../_shared/db.ts";
 import { commitRaceResult, prepareRace } from "../_shared/engine/season.ts";
+import { replayLiveRaceAudit } from "../_shared/engine/liveAudit.ts";
 import type { RaceResult, ClassifiedEntry } from "../_shared/engine/types.ts";
+import type { LiveRaceAudit } from "../_shared/engine/liveRace.ts";
 
 interface Body {
   lobbyId?: string;
   result?: RaceResult;
+  audit?: LiveRaceAudit;
 }
 
 /**
  * Records the result of an interactive live race.
  *
- * A live race is played in real time by the players, so the host's client owns
- * the simulation and sends the finishing order. Everything that actually
- * affects the career — which drivers and teams may appear at all, the race
- * identity and the championship points — is recomputed here from the shared
- * career snapshot, so a tampered client cannot award itself points, invent
- * drivers or claim a different circuit.
+ * The host streams the race and sends the instruction audit (commands and
+ * control handovers). The server replays that log through the same deterministic
+ * engine and uses its finishing order, so a tampered client cannot invent a
+ * result, award itself points or claim a different circuit.
  */
 Deno.serve(
   handler(async (req) => {
     const user = await requireUser(req);
     const body = await readJson<Body>(req);
     if (!body.lobbyId) throw new HttpError(400, "lobbyId is required.");
-    if (!body.result) throw new HttpError(400, "result is required.");
+    if (!body.result && !body.audit) throw new HttpError(400, "result or audit is required.");
 
     const lobby = await loadLobby(body.lobbyId);
     await requireMember(lobby.id, user.id);
@@ -38,16 +39,12 @@ Deno.serve(
       if (existing) return json({ bundle, result: existing });
     }
 
-    const members = await loadMembers(lobby.id);
-    const required = members.filter((m) => m.online);
-    const ready = new Set(bundle.weekend.readyUserIds);
-    const notReady = required.filter((m) => !ready.has(m.user_id));
-    if (notReady.length > 0) {
-      throw new HttpError(409, `Cannot record: ${notReady.map((m) => m.username).join(", ")} not ready.`);
-    }
-
+    // A live race may be started before every principal is ready; they can join
+    // late and the host's authoritative audit already includes their cars.
     const prep = prepareRace(bundle);
-    const incoming = body.result;
+    // The audit is the source of truth. Legacy clients without one still pass
+    // through the stricter identity/field validation below.
+    const incoming = body.audit ? replayLiveRaceAudit(bundle, body.audit).result : body.result!;
     if (incoming.circuitId !== prep.circuit.id) {
       throw new HttpError(400, "Result does not match the scheduled race.");
     }

@@ -12,7 +12,6 @@ import { LiveRaceView, type LiveRaceOnline } from "../components/LiveRace";
 import { getCircuit } from "../data/circuits";
 import { deriveAxes, hasDetailedSetup, setupPenalty, type Setup } from "../engine/car";
 import type { LapRecord, RaceIncident, RaceResult, WeatherState } from "../engine/types";
-import type { LiveTransport } from "../backend/types";
 import { balanceOf, findTeam } from "../lib/career";
 import { lapTime, money } from "../lib/format";
 
@@ -41,27 +40,14 @@ function setupSummary(setup: Setup): Array<[string, string]> {
 }
 
 export function RaceWeekendPage() {
-  const { bundle, user, lobby, myTeamId, isHost, mode, backend, applyAction, startRace, commitRace, setReady, pushToast, refresh } = useSession();
+  const { bundle, user, lobby, myTeamId, isHost, mode, applyAction, startRace, commitRace, setReady, pushToast, refresh, liveTransport } = useSession();
   const [busy, setBusy] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const [live, setLive] = useState(false);
 
-  // One live-race channel per open lobby. The host streams the race on it; the
-  // guests listen for the start and then render the host's beats. It is created
-  // inside the effect (rather than memoised) so a remount always gets a fresh,
-  // open channel — StrictMode's double-invoke would otherwise close a shared one.
-  const lobbyId = lobby?.id ?? null;
+  // The shared transport lives in the session provider, so a guest can be sent
+  // here from any page and there is only one live-race subscription per tab.
   const userId = user?.id ?? null;
-  const [liveTransport, setLiveTransport] = useState<LiveTransport | null>(null);
-  useEffect(() => {
-    if (!lobbyId || !userId) return;
-    const transport = backend.openLive(lobbyId, userId);
-    setLiveTransport(transport);
-    return () => {
-      setLiveTransport(null);
-      transport.close();
-    };
-  }, [backend, lobbyId, userId]);
 
   // Keep the wire props stable: a fresh object here would re-subscribe every render.
   const peers = useMemo(
@@ -69,30 +55,39 @@ export function RaceWeekendPage() {
     [lobby?.members],
   );
   const liveOnline = useMemo<LiveRaceOnline | null>(
-    () => (liveTransport && userId ? { transport: liveTransport, userId, isHost, peers } : null),
-    [liveTransport, userId, isHost, peers],
+    () =>
+      liveTransport && userId
+        ? { transport: liveTransport, userId, isHost, hostUserId: lobby?.hostUserId ?? null, peers }
+        : null,
+    [liveTransport, userId, isHost, lobby?.hostUserId, peers],
   );
-  const syncPendingRef = useRef(false);
+  const currentSessionRef = useRef<string | undefined>(undefined);
+  const leftSessionRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!liveTransport || isHost) return;
-    // Ask the host for the current state: if a live race is already running
-    // (page opened mid-race) that answer is what opens the live view. After the
-    // guest leaves, later beats are ignored rather than reopening it.
-    syncPendingRef.current = true;
+    // Ask for the current state immediately: this opens the live view on a
+    // reconnect and recovers if the original start broadcast was missed.
     liveTransport.send({ t: "sync" });
-    return liveTransport.listen((message) => {
-      if (message.t === "start") {
-        syncPendingRef.current = false;
+    const sessionOf = (
+      message: { t: "start"; session: { sessionId: string } } | { t: "beat"; beat: { sessionId: string } },
+    ): string => (message.t === "start" ? message.session.sessionId : message.beat.sessionId);
+    return liveTransport.listen((message, from) => {
+      if (!lobby?.hostUserId || from !== lobby.hostUserId) return;
+      if (message.t === "start" || message.t === "beat") {
+        const sessionId = sessionOf(message);
+        const first = currentSessionRef.current !== sessionId;
+        currentSessionRef.current = sessionId;
+        if (leftSessionRef.current === sessionId) return;
         setLive(true);
-        pushToast("info", "The host has started the live race.");
-      } else if (message.t === "beat" && syncPendingRef.current) {
-        syncPendingRef.current = false;
-        setLive(true);
+        if (message.t === "start" && first) pushToast("info", "The host has started the live race.");
       } else if (message.t === "abort") {
+        leftSessionRef.current = undefined;
+        setLive(false);
+      } else if (message.t === "end") {
         setLive(false);
       }
     });
-  }, [liveTransport, isHost, pushToast]);
+  }, [liveTransport, isHost, lobby?.hostUserId, pushToast]);
 
   if (!bundle || !user || !lobby) return null;
   const circuit = getCircuit(bundle.weekend.circuitId);
@@ -161,9 +156,12 @@ export function RaceWeekendPage() {
           bundle={bundle}
           myTeamId={myTeamId}
           online={liveOnline}
-          onAbort={() => setLive(false)}
-          onFinish={async (res) => {
-            await commitRace(res);
+          onAbort={() => {
+            leftSessionRef.current = currentSessionRef.current;
+            setLive(false);
+          }}
+          onFinish={async (res, audit) => {
+            await commitRace(res, audit);
             setLive(false);
             pushToast("success", "Race recorded — results are in.");
           }}
@@ -312,17 +310,17 @@ export function RaceWeekendPage() {
                   </button>
                   {isHost ? (
                     <>
-                      <button className="btn-primary" onClick={() => setLive(true)} disabled={!myTeamId || readyCount < online.length}>
+                      <button className="btn-primary" onClick={() => setLive(true)} disabled={!myTeamId} title="Start now — late or unready principals can still join the live race">
                         <Radio size={15} /> Go live
                       </button>
-                      <button className="btn-ghost" onClick={() => void runStart()} disabled={starting || readyCount < online.length || !myTeamId}>
+                      <button className="btn-ghost" onClick={() => void runStart()} disabled={starting || !myTeamId} title="Simulate the race instantly — ready status is advisory">
                         {starting ? <Spinner label="Simulating…" /> : <><Flag size={15} /> Quick sim</>}
                       </button>
                     </>
                   ) : (
-                    <span className="text-xs text-gray-500">Only the host can start the race once everyone is ready — if they go live, this screen switches to the shared race automatically.</span>
+                    <span className="text-xs text-gray-500">Only the host can start the shared race — if they go live, every connected principal is taken to the race automatically. Unready players can still join.</span>
                   )}
-                  {isHost && readyCount < online.length && <span className="text-xs text-amber-400">All online principals must be ready.</span>}
+                  {isHost && readyCount < online.length && <span className="text-xs text-amber-400">Some principals are not ready; Go Live will still start and they can join late.</span>}
                 </div>
                 <p className="mt-2 text-[11px] text-gray-500">Short on cash? Races cost repairs and travel — running at least two healthy drivers is strongly advised. Current balance: {money(balance, { compact: true })}.</p>
               </Panel>

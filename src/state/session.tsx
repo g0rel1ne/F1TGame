@@ -1,8 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { createBackend, type Backend, type AuthUser, type CareerAction, type CareerActionExtra } from "../backend";
+import { createBackend, type Backend, type AuthUser, type CareerAction, type CareerActionExtra, type LiveTransport } from "../backend";
 import type { CareerBundle } from "../engine/season";
 import type { ChatMessage, Lobby, RaceResult } from "../engine/types";
 import type { ContractOffer, NegotiationResult } from "../engine/drivermarket";
+import type { LiveRaceAudit } from "../engine/liveRace";
 
 export interface Toast {
   id: string;
@@ -20,6 +21,8 @@ interface SessionValue {
   error: string | null;
   toasts: Toast[];
   mode: Backend["mode"];
+  /** One shared live-race channel for the open lobby. */
+  liveTransport: LiveTransport | null;
 
   register(username: string, email: string, password: string): Promise<void>;
   login(email: string, password: string): Promise<void>;
@@ -33,7 +36,7 @@ interface SessionValue {
   refresh(): Promise<void>;
   applyAction(action: CareerAction): Promise<CareerActionExtra>;
   startRace(): Promise<RaceResult>;
-  commitRace(result: RaceResult): Promise<void>;
+  commitRace(result: RaceResult, audit?: LiveRaceAudit): Promise<void>;
   negotiate(driverId: string, teamId: string, offer: ContractOffer): Promise<NegotiationResult>;
   setReady(ready: boolean): Promise<void>;
   sendChat(body: string): Promise<void>;
@@ -74,6 +77,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [liveTransport, setLiveTransport] = useState<LiveTransport | null>(null);
   const lobbyIdRef = useRef<string | null>(null);
 
   const pushToast = useCallback((kind: Toast["kind"], message: string) => {
@@ -133,6 +137,24 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     return unsub;
   }, [lobby?.id, backend, refresh]);
 
+  // One live-race channel is shared by the whole app, so a guest can be
+  // redirected into the race from any page and Race Weekend does not create a
+  // second competing subscription.
+  useEffect(() => {
+    const id = lobby?.id;
+    const userId = user?.id;
+    if (!id || !userId) {
+      setLiveTransport(null);
+      return;
+    }
+    const transport = backend.openLive(id, userId);
+    setLiveTransport(transport);
+    return () => {
+      setLiveTransport(null);
+      transport.close();
+    };
+  }, [backend, lobby?.id, user?.id]);
+
   // Presence heartbeat.
   useEffect(() => {
     const id = lobby?.id;
@@ -181,6 +203,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     error,
     toasts,
     mode: backend.mode,
+    liveTransport,
 
     register: async (username, email, password) => {
       const u = await backend.auth.register(username, email, password);
@@ -226,9 +249,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       await refresh();
       return res.result;
     },
-    commitRace: async (result) => {
+    commitRace: async (result, audit) => {
       if (!user || !lobby) throw new Error("No active lobby.");
-      const res = await backend.commitRace(lobby.id, user.id, result);
+      const res = await backend.commitRace(lobby.id, user.id, result, audit);
       setBundle(res.bundle);
       await refresh();
     },

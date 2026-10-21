@@ -33,8 +33,12 @@ import { generateIncident, type IncidentContext, type NearbyCar } from "./incide
 import { evolveWeather } from "./weather";
 import { circuitIqWeight, racerSkill } from "./driverIq";
 import type { RaceSimEntrant } from "./race";
+import { getCircuitProfile, type CircuitProfile } from "./trackProfile";
 
 export type Pace = "conserve" | "normal" | "push";
+export type FuelMode = "lean" | "standard" | "rich";
+export type ErsMode = "off" | "medium" | "high";
+export type PitPhase = "none" | "entry" | "stop" | "exit";
 
 export interface DriverCommand {
   pace: Pace;
@@ -42,6 +46,41 @@ export interface DriverCommand {
   pitRequest: boolean;
   /** Compound to fit when boxing, or null to let the pit wall choose. */
   pitCompound: Compound | null;
+  /** Fuel mixture: lean saves fuel, rich releases performance. */
+  fuelMode: FuelMode;
+  /** ERS deployment level for the next lap. */
+  ers: ErsMode;
+}
+
+export type LiveControlMode = "human" | "ai";
+
+/**
+ * Every state-changing instruction applied to a live session, in delivery
+ * order. Replaying this log against the same career and seed reproduces the
+ * race exactly, so the server can validate a result instead of trusting the
+ * host's finishing order.
+ */
+export type LiveAuditEntry =
+  | { afterLap: number; type: "command"; driverId: string; patch: Partial<DriverCommand> }
+  | { afterLap: number; type: "control"; driverId: string; mode: LiveControlMode };
+
+export interface LiveRaceAudit {
+  sessionId: string;
+  raceId: string;
+  entries: LiveAuditEntry[];
+}
+
+const ALL_COMPOUNDS: Compound[] = ["soft", "medium", "hard", "intermediate", "wet"];
+
+/** Only a tiny, well-understood set of fields may be set remotely or replayed. */
+export function sanitizeDriverCommand(patch: Partial<DriverCommand>): Partial<DriverCommand> {
+  const out: Partial<DriverCommand> = {};
+  if (patch.pace === "conserve" || patch.pace === "normal" || patch.pace === "push") out.pace = patch.pace;
+  if (patch.pitCompound && ALL_COMPOUNDS.includes(patch.pitCompound)) out.pitCompound = patch.pitCompound;
+  if (typeof patch.pitRequest === "boolean") out.pitRequest = patch.pitRequest;
+  if (patch.fuelMode === "lean" || patch.fuelMode === "standard" || patch.fuelMode === "rich") out.fuelMode = patch.fuelMode;
+  if (patch.ers === "off" || patch.ers === "medium" || patch.ers === "high") out.ers = patch.ers;
+  return out;
 }
 
 export type LiveEventKind =
@@ -76,10 +115,32 @@ export interface LiveCarView {
   retired: boolean;
   pits: number;
   pace: Pace;
+  fuelMode: FuelMode;
+  ers: ErsMode;
+  ersCharge: number;
   fuelLaps: number;
   damagePct: number;
+  /** The principal owns this car, whether or not they currently have control. */
   controlled: boolean;
+  controlMode: LiveControlMode;
+  /** Fraction of the current lap, following the corner-speed profile. */
   trackProgress: number;
+  /** Laps completed at the last timing line. */
+  lapsCompleted: number;
+  /** Current local speed, 0..1 of a flat-out straight. */
+  speed: number;
+  braking: boolean;
+  drs: boolean;
+  blueFlag: boolean;
+  penaltyCount: number;
+  penaltySeconds: number;
+  pitPhase: PitPhase;
+  /** 0..1 progress through the pit lane while `pitPhase` is active. */
+  pitProgress: number;
+  /** Wheel-to-wheel contact risk, used for sparks and side-by-side rendering. */
+  contact: number;
+  /** Track height at the car's current position, relative to the lap minimum. */
+  elevationMetres: number;
 }
 
 export interface LiveSnapshot {
@@ -89,10 +150,16 @@ export interface LiveSnapshot {
   weather: WeatherState;
   cars: LiveCarView[];
   finished: boolean;
+  /** Where the safety car sits on the lap, if one is deployed. */
+  safetyCarProgress: number | null;
+  /** Broadcast clock, 0..1 through the current lap. */
+  lapFraction: number;
 }
 
 export interface LiveRaceInit {
   raceId: string;
+  /** Stable id for one live session; used to correlate reconnects and audits. */
+  sessionId?: string;
   seed: number;
   circuit: Circuit;
   totalLaps: number;
@@ -122,9 +189,24 @@ interface LiveCar extends CarRuntime {
   lapsCompleted: number;
   command: DriverCommand;
   controlled: boolean;
+  controlMode: LiveControlMode;
+  ersCharge: number;
+  penaltyCount: number;
+  pitPhase: PitPhase;
+  pitProgress: number;
+  contact: number;
+  lapTarget: number;
+  broadcastProgress: number;
+  broadcastSpeed: number;
+  broadcastBraking: boolean;
+  broadcastDrs: boolean;
 }
 
 const PACE_DELTA: Record<Pace, number> = { conserve: 0.45, normal: 0, push: -0.4 };
+const FUEL_DELTA: Record<FuelMode, number> = { lean: 0.24, standard: 0, rich: -0.16 };
+const FUEL_BURN: Record<FuelMode, number> = { lean: 0.66, standard: 1, rich: 1.28 };
+const ERS_DELTA: Record<ErsMode, number> = { off: 0.1, medium: -0.06, high: -0.2 };
+const ERS_DRAIN: Record<ErsMode, number> = { off: 0, medium: 0.14, high: 0.32 };
 
 /** Radio acknowledgements, picked by pace so the engineer feels alive. */
 const PACE_ACK: Record<Pace, string[]> = {
@@ -135,6 +217,7 @@ const PACE_ACK: Record<Pace, string[]> = {
 
 export class LiveRace {
   readonly raceId: string;
+  readonly sessionId: string;
   readonly totalLaps: number;
   readonly circuit: Circuit;
   readonly seed: number;
@@ -143,6 +226,7 @@ export class LiveRace {
   laps: LapRecord[] = [];
   incidents: RaceIncident[] = [];
   events: LiveEvent[] = [];
+  auditEntries: LiveAuditEntry[] = [];
   flag: FlagState = "green";
   lap = 0;
   weather: WeatherState;
@@ -157,6 +241,7 @@ export class LiveRace {
   private readonly severitySetting: "lenient" | "realistic" | "strict";
   private readonly qualifying: QualifyingResultRow[];
   private readonly poleDriverId: string | null;
+  private readonly profile: CircuitProfile;
   private neutralisedLaps = 0;
   private eventSeq = 0;
   private overallBest = Number.POSITIVE_INFINITY;
@@ -164,6 +249,7 @@ export class LiveRace {
 
   constructor(opts: LiveRaceInit) {
     this.raceId = opts.raceId;
+    this.sessionId = opts.sessionId ?? opts.raceId;
     this.totalLaps = opts.totalLaps;
     this.circuit = opts.circuit;
     this.seed = opts.seed;
@@ -175,6 +261,7 @@ export class LiveRace {
     this.prevCondition = opts.weatherStart.condition;
     this.rng = new Rng(`${opts.seed}:live`);
     this.specs = defaultTireSpecs(opts.circuit);
+    this.profile = getCircuitProfile(opts.circuit);
 
     const controlled = new Set(opts.controlledDriverIds);
     this.cars = opts.entrants
@@ -210,7 +297,30 @@ export class LiveRace {
           cumulativeTime: e.gridPosition * 0.7,
           lapsCompleted: 0,
           controlled: controlled.has(e.driverId),
-          command: { pace: "normal", pitRequest: false, pitCompound: null },
+          controlMode: controlled.has(e.driverId) ? "human" : "ai",
+          command: { pace: "normal", pitRequest: false, pitCompound: null, fuelMode: "standard", ers: "medium" },
+          ersCharge: 0.72,
+          penaltyCount: 0,
+          pitPhase: "none",
+          pitProgress: 0,
+          contact: 0,
+          lapTarget: composeLapTime({
+            circuit: opts.circuit,
+            car: e.car,
+            driver: e.driver,
+            blockTimeDelta: 0,
+            tireDelta: 0,
+            fuelLaps: opts.totalLaps,
+            fuelCapacityLaps: opts.totalLaps,
+            setup: e.setup,
+            damage: initDamage(),
+            noiseSeconds: 0,
+            wetness: opts.weatherStart.trackWetness,
+          }),
+          broadcastProgress: 0,
+          broadcastSpeed: 0.4,
+          broadcastBraking: false,
+          broadcastDrs: false,
         } satisfies LiveCar;
       })
       .sort((a, b) => a.trackPosition - b.trackPosition);
@@ -222,21 +332,46 @@ export class LiveRace {
 
   setCommand(driverId: string, patch: Partial<DriverCommand>): LiveEvent | null {
     const c = this.cars.find((x) => x.driverId === driverId);
-    if (!c || !c.controlled || c.retired) return null;
+    if (!c || !c.controlled || c.controlMode !== "human" || c.retired) return null;
+    const clean = sanitizeDriverCommand(patch);
+    if (Object.keys(clean).length === 0) return null;
     const before = c.command;
-    c.command = { ...before, ...patch };
+    c.command = { ...before, ...clean };
+    this.auditEntries.push({ afterLap: this.lap, type: "command", driverId, patch: { ...clean } });
 
-    if (patch.pace && patch.pace !== before.pace) {
-      const ack = PACE_ACK[patch.pace][this.eventSeq % PACE_ACK[patch.pace].length];
+    if (clean.pace && clean.pace !== before.pace) {
+      const ack = PACE_ACK[clean.pace][this.eventSeq % PACE_ACK[clean.pace].length];
       return this.pushEvent(this.lap, "radio", ack, "#93c5fd", "info", driverId);
     }
-    if (patch.pitRequest && !before.pitRequest) {
+    if (clean.pitRequest && !before.pitRequest) {
       return this.pushEvent(this.lap, "radio", "Box this lap, box — confirmed.", "#93c5fd", "info", driverId);
     }
-    if (patch.pitRequest === false && before.pitRequest) {
+    if (clean.pitRequest === false && before.pitRequest) {
       return this.pushEvent(this.lap, "radio", "Stay out, stay out — cancel the stop.", "#93c5fd", "info", driverId);
     }
     return null;
+  }
+
+  /**
+   * Hand a principal's cars to the AI when they disconnect and back when they
+   * reconnect. The log makes the handover part of the deterministic replay.
+   */
+  setControlMode(driverId: string, mode: LiveControlMode): LiveEvent | null {
+    const c = this.cars.find((x) => x.driverId === driverId);
+    if (!c || !c.controlled || c.retired || c.controlMode === mode) return null;
+    c.controlMode = mode;
+    c.command = { pace: "normal", pitRequest: false, pitCompound: null, fuelMode: "standard", ers: "medium" };
+    this.auditEntries.push({ afterLap: this.lap, type: "control", driverId, mode });
+    return this.pushEvent(
+      this.lap,
+      "radio",
+      mode === "ai"
+        ? `${c.driver.name} — connection lost. The pit wall is taking over.`
+        : `${c.driver.name} — connection restored. You have the car.`,
+      "#93c5fd",
+      mode === "ai" ? "warn" : "good",
+      driverId,
+    );
   }
 
   /** Advance exactly one lap. Returns the events produced by that lap. */
@@ -256,9 +391,11 @@ export class LiveRace {
     const neutralised = this.neutralisedLaps > 0;
     const liveOrder = this.order();
 
+    const ersAvailable = (c: LiveCar) => c.ersCharge > 0.08;
     for (const c of liveOrder) {
       const tire = evaluateTire(specs[c.compound], c.tireAgeLaps, this.envFor(c));
-      c.raw =
+      const ersDelta = ersAvailable(c) ? ERS_DELTA[c.command.ers] : ERS_DELTA.off;
+      c.lapTarget =
         composeLapTime({
           circuit,
           car: c.car,
@@ -271,7 +408,10 @@ export class LiveRace {
           damage: c.damage,
           noiseSeconds: rng.gaussian(0, 0.22),
           wetness: this.weather.trackWetness,
-        }) + PACE_DELTA[c.command.pace];
+        }) + PACE_DELTA[c.command.pace] + FUEL_DELTA[c.command.fuelMode] + ersDelta;
+      // Running dry is a genuine emergency, not a subtle pace offset.
+      if (c.fuelLaps <= 0.15) c.lapTarget += 18;
+      c.raw = c.lapTarget;
     }
 
     if (neutralised) {
@@ -365,16 +505,33 @@ export class LiveRace {
         c.pitThisLap = false;
         continue;
       }
+
+      // Track limits: pushing hard and running rich makes a mistake more likely,
+      // especially at a high-commitment circuit. The penalty is real time added
+      // to the car's race total, not just a banner.
+      if (!neutralised && rng.chance(
+        0.0025 +
+        (c.command.pace === "push" ? 0.0045 : 0) +
+        (c.command.fuelMode === "rich" ? 0.0015 : 0) +
+        circuit.brakingDemand * 0.003,
+      )) {
+        c.penaltySeconds += 5;
+        c.penaltyCount += 1;
+        this.pushEvent(lap, "incident", `${c.driver.name} exceeds track limits — five-second penalty.`, "#fbbf24", "warn", c.driverId);
+      }
+
       c.cumulativeTime += c.raw + c.penaltySeconds;
       c.penaltySeconds = 0;
       c.lapsCompleted += 1;
       c.lastLapTime = round(c.raw, 3);
       if (c.bestLapTime === null || c.raw < c.bestLapTime) c.bestLapTime = round(c.raw, 3);
       c.lapTimes.push(round(c.raw, 3));
-      c.trackProgress = (lap / totalLaps) % 1;
+      c.trackProgress = (c.lapsCompleted / totalLaps) % 1;
       if (c.pitThisLap) c.pitsMade += 1;
       c.pitThisLap = false;
-      c.fuelLaps = Math.max(0, c.fuelLaps - 1);
+      const burn = FUEL_BURN[c.command.fuelMode];
+      c.fuelLaps = Math.max(0, c.fuelLaps - burn);
+      c.ersCharge = clamp(c.ersCharge + 0.16 - (ersAvailable(c) ? ERS_DRAIN[c.command.ers] : 0), 0, 1);
       c.tireAgeLaps += 1;
 
       if (c.lastLapTime && c.lastLapTime < this.overallBest && this.flag === "green") {
@@ -397,7 +554,7 @@ export class LiveRace {
 
     // Radio reminder if a controlled car's tyres are past their prime.
     for (const c of afterOrder) {
-      if (!c.controlled || c.retired) continue;
+      if (!c.controlled || c.controlMode !== "human" || c.retired) continue;
       const spec = specs[c.compound];
       if (c.tireAgeLaps > spec.lifeLaps * 0.95 && !c.command.pitRequest) {
         this.pushEvent(lap, "radio", `${c.driver.name}'s tyres are going off — consider boxing.`, "#fbbf24", "warn", c.driverId);
@@ -422,31 +579,139 @@ export class LiveRace {
   }
 
   snapshot(): LiveSnapshot {
-    const sorted = [...this.cars].sort((a, b) => a.trackPosition - b.trackPosition);
-    const cars: LiveCarView[] = sorted.map((c, i) => ({
-      driverId: c.driverId,
-      teamId: c.teamId,
-      position: i + 1,
-      compound: c.compound,
-      tireAge: c.tireAgeLaps,
-      gapToLeader: c.gapToLeader,
-      gapAhead: null,
-      lastLapTime: c.lastLapTime,
-      bestLapTime: c.bestLapTime,
-      pit: c.pitThisLap,
-      pitRequest: c.command.pitRequest,
-      pitCompound: c.command.pitCompound,
-      retired: c.retired,
-      pits: c.pitsMade,
-      pace: c.command.pace,
-      fuelLaps: c.fuelLaps,
-      damagePct: clamp(totalDamage(c.damage) / 3, 0, 1),
-      controlled: c.controlled,
-      trackProgress: c.trackProgress,
-    }));
-    for (let i = 1; i < cars.length; i++) {
-      cars[i].gapAhead = round(Math.max(0, cars[i].gapToLeader - cars[i - 1].gapToLeader), 3);
+    return this.broadcastSnapshot(0);
+  }
+
+  /**
+   * Sub-lap broadcast state. The official classification still comes from the
+   * deterministic lap model, but this projects every car along the circuit's
+   * corner-speed profile, so the broadcast shows braking, acceleration,
+   * side-by-side battles and live position changes.
+   */
+  broadcastSnapshot(lapFraction: number): LiveSnapshot {
+    const u = this.finished ? 1 : clamp(lapFraction, 0, 1);
+    const running = this.cars.filter((c) => !c.retired);
+    const ordered = [...running].sort((a, b) => a.cumulativeTime - b.cumulativeTime);
+    const leader = ordered[0] ?? null;
+    const leaderLaps = Math.max(0, ...this.cars.map((c) => c.lapsCompleted));
+    const leaderTarget = leader?.lapTarget ?? this.circuit.referenceLapSeconds;
+
+    const projected = this.cars.map((c) => {
+      const target = Math.max(45, c.lapTarget || this.circuit.referenceLapSeconds);
+      const elapsed = u * leaderTarget - c.gapToLeader;
+      let distance = leaderLaps + elapsed / target;
+      let timeFraction = (elapsed / target) % 1;
+      if (timeFraction < 0) timeFraction += 1;
+
+      if (this.flag === "red-flag") {
+        distance = c.lapsCompleted + c.broadcastProgress;
+        timeFraction = c.broadcastProgress;
+      }
+      if (this.finished) {
+        distance = c.lapsCompleted;
+        timeFraction = 1;
+      }
+
+      const progress = this.finished ? 1 : this.profile.progressAtTime(timeFraction);
+      const speed = this.finished || this.flag === "red-flag" ? 0 : this.profile.speedAt(progress) * (this.circuit.referenceLapSeconds / target);
+      const ahead = this.profile.speedAt((progress + 0.02) % 1);
+      const cornerNow = this.profile.cornerAt(progress);
+      const cornerAhead = this.profile.cornerAt((progress + 0.02) % 1);
+      const braking = !this.finished && (speed > ahead * 1.003 || (cornerAhead !== null && cornerAhead !== cornerNow));
+      const drsZone = this.circuit.drsZones.some((z) => {
+        const span = (z.end - z.start + 1) % 1;
+        const rel = (progress - z.start + 1) % 1;
+        return rel <= (span || 1);
+      });
+      return { c, target, distance, progress, timeFraction, speed, braking, drsZone };
+    });
+
+    // Safety-car queue: the leader controls the pace and the field closes up.
+    if (this.flag === "safety-car" && leader && ordered.length > 0) {
+      const leaderProjection = projected.find((p) => p.c === leader)!;
+      ordered.forEach((c, i) => {
+        const p = projected.find((x) => x.c === c)!;
+        p.progress = (leaderProjection.progress - i * 0.012 + 1) % 1;
+        p.distance = leaderProjection.distance - i * 0.009;
+        p.timeFraction = this.profile.timeAt(p.progress);
+        p.speed = this.profile.speedAt(p.progress);
+      });
     }
+
+    const sorted = [...projected].sort((a, b) => {
+      if (a.c.retired !== b.c.retired) return a.c.retired ? 1 : -1;
+      return b.distance - a.distance;
+    });
+    const leaderDistance = sorted[0]?.distance ?? 0;
+
+    const cars: LiveCarView[] = sorted.map((p, i) => {
+      const c = p.c;
+      const inPitWindow = c.command.pitRequest && !c.retired && !this.finished && (p.progress > 0.885 || p.progress < 0.075);
+      const pitPhase: PitPhase = c.retired || !inPitWindow
+        ? "none"
+        : p.progress > 0.97 || p.progress < 0.02
+          ? "stop"
+          : p.progress > 0.9
+            ? "entry"
+            : "exit";
+      const pitProgress = inPitWindow
+        ? p.progress > 0.9
+          ? clamp((p.progress - 0.885) / 0.115, 0, 1)
+          : clamp((p.progress + 0.115) / 0.19, 0, 1)
+        : 0;
+      const ahead = sorted[i - 1];
+      const gapAhead = ahead ? Math.max(0, (ahead.distance - p.distance) * p.target) : null;
+      const gapToLeader = Math.max(0, (leaderDistance - p.distance) * p.target);
+      const blueFlag = !c.retired && leaderDistance - p.distance > 0.78 && leaderDistance - p.distance < 1.2;
+      const contact = ahead && gapAhead !== null && gapAhead < 0.32 && !c.retired && !ahead.c.retired
+        ? clamp(1 - gapAhead / 0.32, 0, 1)
+        : 0;
+      const drs = !!ahead && p.drsZone && gapAhead !== null && gapAhead < 1.0 && this.weather.trackWetness < 0.35;
+
+      c.broadcastProgress = p.progress;
+      c.broadcastSpeed = p.speed;
+      c.broadcastBraking = p.braking;
+      c.broadcastDrs = drs;
+      c.contact = contact;
+
+      return {
+        driverId: c.driverId,
+        teamId: c.teamId,
+        position: i + 1,
+        compound: c.compound,
+        tireAge: c.tireAgeLaps,
+        gapToLeader: round(gapToLeader, 3),
+        gapAhead: gapAhead === null ? null : round(gapAhead, 3),
+        lastLapTime: c.lastLapTime,
+        bestLapTime: c.bestLapTime,
+        pit: inPitWindow,
+        pitRequest: c.command.pitRequest,
+        pitCompound: c.command.pitCompound,
+        retired: c.retired,
+        pits: c.pitsMade,
+        pace: c.command.pace,
+        fuelMode: c.command.fuelMode,
+        ers: c.command.ers,
+        ersCharge: round(c.ersCharge, 3),
+        fuelLaps: c.fuelLaps,
+        damagePct: clamp(totalDamage(c.damage) / 3, 0, 1),
+        controlled: c.controlled,
+        controlMode: c.controlMode,
+        trackProgress: p.progress,
+        lapsCompleted: c.lapsCompleted,
+        speed: round(p.speed, 3),
+        braking: p.braking,
+        drs,
+        blueFlag,
+        penaltyCount: c.penaltyCount,
+        penaltySeconds: c.penaltySeconds,
+        pitPhase,
+        pitProgress,
+        contact,
+        elevationMetres: round(this.profile.elevationAt(p.progress), 1),
+      } satisfies LiveCarView;
+    });
+
     return {
       lap: this.lap,
       totalLaps: this.totalLaps,
@@ -454,10 +719,29 @@ export class LiveRace {
       weather: this.weather,
       cars,
       finished: this.finished,
+      safetyCarProgress: this.flag === "safety-car" ? this.profile.progressAtTime((u + 0.035) % 1) : null,
+      lapFraction: u,
     };
   }
 
-  finalize(): { result: RaceResult; damageByDriver: Record<string, DamageState>; runtimeByDriver: Record<string, CarRuntime> } {
+  audit(): LiveRaceAudit {
+    return {
+      sessionId: this.sessionId,
+      raceId: this.raceId,
+      entries: this.auditEntries.map((e) =>
+        e.type === "command"
+          ? { ...e, patch: { ...e.patch } }
+          : { ...e },
+      ),
+    };
+  }
+
+  finalize(): {
+    result: RaceResult;
+    damageByDriver: Record<string, DamageState>;
+    runtimeByDriver: Record<string, CarRuntime>;
+    audit: LiveRaceAudit;
+  } {
     const { circuit, ruleset } = this;
     const finishers = [...this.cars].sort((a, b) => {
       if (a.retired !== b.retired) return a.retired ? 1 : -1;
@@ -498,7 +782,7 @@ export class LiveRace {
         pits: c.pitsMade,
         fastestLap: isFastest,
         gridPosition: c.gridPosition,
-        penalties: 0,
+        penalties: c.penaltyCount,
       };
     });
 
@@ -551,7 +835,7 @@ export class LiveRace {
       createdAt: Date.now(),
     };
 
-    return { result, damageByDriver, runtimeByDriver };
+    return { result, damageByDriver, runtimeByDriver, audit: this.audit() };
   }
 
   // -- internals ------------------------------------------------------------
@@ -629,7 +913,7 @@ export class LiveRace {
       let shouldStop = false;
       let next: Compound;
 
-      if (c.controlled) {
+      if (c.controlled && c.controlMode === "human") {
         if (!c.command.pitRequest) continue;
         shouldStop = true;
         next = c.command.pitCompound ?? this.autoCompound(c);
@@ -663,7 +947,7 @@ export class LiveRace {
       c.tireAgeLaps = 0;
       c.nextPitIndex = Math.min(c.nextPitIndex + 1, c.strategy.compounds.length);
       c.pitThisLap = true;
-      if (c.controlled) {
+      if (c.controlled && c.controlMode === "human") {
         c.command.pitRequest = false;
         c.command.pitCompound = null;
       }

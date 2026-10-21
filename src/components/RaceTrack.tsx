@@ -14,6 +14,16 @@ export interface RaceTrackCar {
   pit?: boolean;
   /** Extra lateral offset (px) used for side-by-side racing in traffic. */
   lane?: number;
+  /** 0..1 of the car's flat-out speed, used for motion blur and brake lights. */
+  speed?: number;
+  braking?: boolean;
+  drs?: boolean;
+  blueFlag?: boolean;
+  pitPhase?: "none" | "entry" | "stop" | "exit";
+  pitProgress?: number;
+  contact?: number;
+  damage?: number;
+  elevationMetres?: number;
 }
 
 export interface RaceTrackCamera {
@@ -37,6 +47,7 @@ export function RaceTrack({
   showSectors = false,
   showPit = true,
   pitBoxColors = [],
+  safetyCarProgress = null,
 }: {
   circuit: Circuit;
   cars: RaceTrackCar[];
@@ -46,10 +57,13 @@ export function RaceTrack({
   showSectors?: boolean;
   showPit?: boolean;
   pitBoxColors?: string[];
+  safetyCarProgress?: number | null;
 }) {
   const geo = useMemo(() => getTrack(circuit, W, H, PAD, ROAD), [circuit]);
 
-  const carLen = ROAD * 0.78;
+  // The road stroke represents ~15 m of asphalt. A 5.6 m F1 car is therefore
+  // just over a third of its width, not most of it as in an arcade top-down.
+  const carLen = ROAD * 0.44;
   const carW = carLen * (120 / 320);
   const maxLateral = ROAD / 2 - carW / 2 - 0.35;
 
@@ -83,7 +97,7 @@ export function RaceTrack({
   const placed = useMemo(
     () =>
       cars.map((c) => {
-        const inPit = c.pit && (c.progress > 0.9 || c.progress < 0.12);
+        const inPit = c.pitPhase ? c.pitPhase !== "none" : c.pit && (c.progress > 0.9 || c.progress < 0.12);
         // All cars run the racing line; traffic adds a small side-by-side shift.
         const racing = geo.racingOffsetAt(c.progress);
         const lateral = inPit
@@ -194,13 +208,68 @@ export function RaceTrack({
         <line x1={startLine.a.x} y1={startLine.a.y} x2={startLine.b.x} y2={startLine.b.y} stroke="#0a0b0e" strokeWidth="2" strokeDasharray="1.6 1.6" />
       </g>
 
+      {/* Safety car */}
+      {safetyCarProgress !== null && (() => {
+        const p = geo.pointAt(safetyCarProgress);
+        const deg = (geo.angleAt(safetyCarProgress) * 180) / Math.PI;
+        return (
+          <g transform={`translate(${p.x.toFixed(2)} ${p.y.toFixed(2)}) rotate(${deg.toFixed(1)})`}>
+            <circle r={ROAD * 0.55} fill="#facc15" opacity="0.25" className="animate-pulse-fast" />
+            <rect x={-carLen / 2} y={-carW / 2} width={carLen} height={carW} rx={carW * 0.2} fill="#f8fafc" stroke="#111827" strokeWidth="0.3" />
+            <rect x={-carLen * 0.28} y={-carW * 0.55} width={carLen * 0.18} height={carW * 1.1} fill="#f59e0b" />
+            <circle cx={carLen * 0.12} cy={0} r={carW * 0.12} fill="#ef4444" />
+          </g>
+        );
+      })()}
+
       {/* Cars */}
-      {placed.map(({ car, p, deg }) => (
-        <g key={car.id} transform={`translate(${p.x.toFixed(2)} ${p.y.toFixed(2)}) rotate(${deg.toFixed(1)})`}>
-          {car.highlight && <ellipse rx={carLen * 0.55} ry={carW * 1.0} fill="none" stroke={car.color} strokeWidth="0.45" opacity="0.9" />}
-          <Car paint={car.paint} style={car.style} width={carLen} height={carW} x={-carLen / 2} y={-carW / 2} />
-        </g>
-      ))}
+      {placed.map(({ car, p, deg }) => {
+        const lift = Math.max(0, Math.min(1, ((car.elevationMetres ?? 0) + 30) / 60));
+        const contact = car.contact ?? 0;
+        const damage = car.damage ?? 0;
+        return (
+          <g key={car.id} transform={`translate(${p.x.toFixed(2)} ${p.y.toFixed(2)}) rotate(${deg.toFixed(1)})`}>
+            <ellipse
+              cx={(lift - 0.5) * 2.4}
+              cy={(lift - 0.5) * 1.6}
+              rx={carLen * 0.5}
+              ry={carW * 0.9}
+              fill="#000"
+              opacity={0.25 + lift * 0.2}
+            />
+            {car.highlight && <ellipse rx={carLen * 0.55} ry={carW * 1.0} fill="none" stroke={car.color} strokeWidth="0.45" opacity="0.9" />}
+            {car.blueFlag && <ellipse rx={carLen * 0.62} ry={carW * 1.12} fill="none" stroke="#3b82f6" strokeWidth="0.5" opacity="0.95" />}
+            <Car paint={car.paint} style={car.style} width={carLen} height={carW} x={-carLen / 2} y={-carW / 2} />
+            {car.braking && (
+              <g fill="#ff2a2a">
+                <circle cx={-carLen * 0.43} cy={-carW * 0.28} r={carW * 0.07} />
+                <circle cx={-carLen * 0.43} cy={carW * 0.28} r={carW * 0.07} />
+              </g>
+            )}
+            {car.drs && <rect x={-carLen * 0.49} y={-carW * 0.2} width={carLen * 0.05} height={carW * 0.4} fill="#22d3ee" opacity="0.95" />}
+            {damage > 0.55 && (
+              <g fill="#94a3b8" opacity={Math.min(0.65, damage - 0.4)}>
+                <circle cx={-carLen * 0.58} cy={-carW * 0.2} r={carW * 0.16} />
+                <circle cx={-carLen * 0.68} cy={carW * 0.1} r={carW * 0.22} />
+              </g>
+            )}
+            {contact > 0.25 && (
+              <g stroke="#fbbf24" strokeWidth={0.28} opacity={Math.min(1, contact)}>
+                <line x1={-carLen * 0.2} y1={-carW * 0.55} x2={-carLen * 0.36} y2={-carW * 0.82} />
+                <line x1={-carLen * 0.1} y1={carW * 0.55} x2={-carLen * 0.26} y2={carW * 0.85} />
+              </g>
+            )}
+            {car.pitPhase === "stop" && (
+              <g opacity="0.95">
+                <rect x={-carLen * 0.55} y={-carW * 1.25} width={carLen * 1.1} height={carW * 0.34} rx={0.4} fill="#111827" stroke="#f59e0b" strokeWidth="0.22" />
+                <text x={0} y={-carW * 1.01} fontSize={carW * 0.22} fill="#fbbf24" fontFamily="JetBrains Mono, monospace" textAnchor="middle">
+                  PIT STOP
+                </text>
+              </g>
+            )}
+          </g>
+        );
+      })}
 
       {/* Car codes (upright) */}
       {placed.map(({ car, p }) =>
@@ -208,8 +277,8 @@ export function RaceTrack({
           <text
             key={`lbl-${car.id}`}
             x={p.x}
-            y={p.y - carW - 1.2}
-            fontSize="3.4"
+            y={p.y - carW - 1.1}
+            fontSize="2.2"
             fill={car.highlight ? "#ffffff" : "#cfd5df"}
             stroke="#0a0b0e"
             strokeWidth="1"

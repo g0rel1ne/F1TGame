@@ -1,5 +1,5 @@
 import { handler, json, HttpError, readJson } from "../_shared/http.ts";
-import { loadCareer, loadLobby, loadMembers, requireHost, requireMember, requireUser, saveCareer } from "../_shared/db.ts";
+import { loadCareer, loadLobby, requireHost, requireMember, requireUser, saveCareer } from "../_shared/db.ts";
 import { runRaceWeekend } from "../_shared/engine/season.ts";
 
 Deno.serve(
@@ -19,14 +19,7 @@ Deno.serve(
       if (existing) return json({ bundle, result: existing });
     }
 
-    const members = await loadMembers(lobby.id);
-    const required = members.filter((m) => m.online);
-    const ready = new Set(bundle.weekend.readyUserIds);
-    const notReady = required.filter((m) => !ready.has(m.user_id));
-    if (notReady.length > 0) {
-      throw new HttpError(409, `Cannot start: ${notReady.map((m) => m.username).join(", ")} not ready.`);
-    }
-
+    // Readiness is advisory: the host may force the start.
     const { bundle: next, result } = runRaceWeekend(bundle);
     await saveCareer(lobby.id, { bundle: next, version: record.version });
     return json({ bundle: next, result });

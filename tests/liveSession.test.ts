@@ -45,8 +45,9 @@ describe("live session voting", () => {
     expect(resolveSpeed({ u1: 2, ghost: 2 }, LOBBY)).toBeNull();
   });
 
-  it("counts the vote tally for display", () => {
-    expect(speedTally({ u1: 2, u2: 2, u3: 4 }, LOBBY)).toEqual({ 1: 0, 2: 2, 4: 1 });
+  it("counts the vote tally for display, including the slow replay speeds", () => {
+    expect(speedTally({ u1: 2, u2: 2, u3: 4 }, LOBBY)).toEqual({ 0.25: 0, 0.5: 0, 1: 0, 2: 2, 4: 1 });
+    expect(speedTally({ u1: 0.25, u2: 0.5, u3: 1 }, LOBBY)).toEqual({ 0.25: 1, 0.5: 1, 1: 1, 2: 0, 4: 0 });
   });
 
   it("applies a skip only when the lobby agrees", () => {
@@ -73,12 +74,24 @@ describe("live session pacing", () => {
   it("scales lap length linearly with the chosen speed", () => {
     expect(lapMsFor(90, 2)).toBeCloseTo(lapMsFor(90, 1) / 2, 6);
     expect(lapMsFor(90, 4)).toBeCloseTo(lapMsFor(90, 1) / 4, 6);
+    expect(lapMsFor(90, 0.5)).toBeCloseTo(lapMsFor(90, 1) * 2, 6);
+    expect(lapMsFor(90, 0.25)).toBeCloseTo(lapMsFor(90, 1) * 4, 6);
   });
 
   it("only treats a beat as stale after several missed laps", () => {
     const beat: LiveBeat = {
       seq: 1,
-      snapshot: { lap: 1, totalLaps: 10, flag: "green", weather: { condition: "dry", intensity: 0, trackWetness: 0, airTempC: 22, trackTempC: 30 }, cars: [], finished: false },
+      sessionId: "session-1",
+      snapshot: {
+        lap: 1,
+        totalLaps: 10,
+        flag: "green",
+        weather: { condition: "dry", intensity: 0, trackWetness: 0, airTempC: 22, trackTempC: 30 },
+        cars: [],
+        finished: false,
+        safetyCarProgress: null,
+        lapFraction: 0,
+      },
       events: [],
       speed: 1,
       paused: false,

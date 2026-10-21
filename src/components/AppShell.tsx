@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import {
   BarChart3, Bell, CalendarDays, Car, ChevronRight, CircleDollarSign, Factory, Flag, Gauge,
@@ -28,11 +28,36 @@ const NAV = [
 ];
 
 export function AppShell({ children }: { children: ReactNode }) {
-  const { lobby, bundle, user, logout, myTeamId, pushToast } = useSession();
+  const { lobby, bundle, user, logout, myTeamId, pushToast, liveTransport, isHost } = useSession();
   const navigate = useNavigate();
   const location = useLocation();
   const [open, setOpen] = useState(false);
   const [bell, setBell] = useState(false);
+  const pathRef = useRef(location.pathname);
+  const joinedSessionRef = useRef<string | null>(null);
+  pathRef.current = location.pathname;
+
+  // A guest can be anywhere in the career when the host goes live. Take them to
+  // the shared race once per session instead of depending on them already
+  // sitting on Race Weekend.
+  useEffect(() => {
+    if (!liveTransport || isHost) return;
+    // Discover a race that is already running (or paused) when this page loads.
+    liveTransport.send({ t: "sync" });
+    return liveTransport.listen((message, from) => {
+      if (!lobby?.hostUserId || from !== lobby.hostUserId) return;
+      const sessionId =
+        message.t === "start" ? message.session.sessionId : message.t === "beat" ? message.beat.sessionId : null;
+      if (!sessionId) return;
+      if (pathRef.current === "/career/race") {
+        joinedSessionRef.current = sessionId;
+        return;
+      }
+      if (joinedSessionRef.current === sessionId) return;
+      joinedSessionRef.current = sessionId;
+      navigate("/career/race");
+    });
+  }, [liveTransport, isHost, lobby?.hostUserId, navigate]);
 
   const team = bundle?.teams.find((t) => t.id === myTeamId) ?? null;
   const news = useMemo(() => (bundle ? [...bundle.news].reverse().slice(0, 12) : []), [bundle]);

@@ -9,6 +9,7 @@ export interface TrackMarker {
   color: string;
   label?: string;
   highlight?: boolean;
+  blue?: boolean;
 }
 
 const W = 400;
@@ -85,6 +86,7 @@ export function TrackMap({
         return (
           <g key={m.id} transform={`translate(${p.x} ${p.y})`}>
             {m.highlight && <circle r="9" fill={m.color} opacity="0.25" className="animate-pulse-fast" />}
+            {m.blue && <circle r="8" fill="none" stroke="#3b82f6" strokeWidth="2" opacity="0.85" />}
             <circle r={m.highlight ? 5.5 : 3.6} fill={m.color} stroke="#0a0b0e" strokeWidth="1.5" />
             {m.label && (
               <text x="6" y="-5" fontSize="7.5" fill="#cfd5df" fontFamily="JetBrains Mono, monospace" paintOrder="stroke" stroke="#0a0b0e" strokeWidth="2.5">

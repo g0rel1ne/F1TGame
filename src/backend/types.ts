@@ -6,6 +6,7 @@ import type { ChatMessage, Lobby, LobbySettings, RaceResult, UpgradeArea } from 
 import type { Setup } from "../engine/car";
 import type { ContractOffer } from "../engine/drivermarket";
 import type { LiveMessage } from "../engine/liveSession";
+import type { LiveRaceAudit } from "../engine/liveRace";
 
 /**
  * A best-effort pub/sub channel used by the live race. In offline mode it is a
@@ -106,8 +107,8 @@ export interface Backend {
   applyAction(lobbyId: string, userId: string, action: CareerAction): Promise<{ bundle: CareerBundle; extra: CareerActionExtra }>;
   negotiate(lobbyId: string, userId: string, driverId: string, teamId: string, offer: ContractOffer): Promise<import("../engine/drivermarket").NegotiationResult>;
   startRace(lobbyId: string, userId: string): Promise<{ bundle: CareerBundle; result: RaceResult }>;
-  /** Commit a result produced by the interactive live race. Host only. */
-  commitRace(lobbyId: string, userId: string, result: RaceResult): Promise<{ bundle: CareerBundle; result: RaceResult }>;
+  /** Commit a live-race result. The backend replays the audit and re-scores it. */
+  commitRace(lobbyId: string, userId: string, result: RaceResult, audit?: LiveRaceAudit): Promise<{ bundle: CareerBundle; result: RaceResult }>;
 
   /**
    * Open a live-race channel for this lobby. Messages published here are not

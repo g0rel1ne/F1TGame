@@ -9,6 +9,7 @@ import {
   type CareerSettings,
 } from "../src/engine/season";
 import { LiveRace } from "../src/engine/liveRace";
+import { replayLiveRaceAudit } from "../src/engine/liveAudit";
 
 const SETTINGS: CareerSettings = {
   aiDifficulty: "normal",
@@ -112,6 +113,41 @@ describe("interactive live race", () => {
     expect(car?.pace).toBe("push");
   });
 
+  it("projects independent sub-lap positions, speeds and brake zones", () => {
+    const { bundle, teamId } = playerBundle();
+    const { engine } = makeEngine(bundle, teamId);
+    engine.step();
+    engine.step();
+
+    const snap = engine.broadcastSnapshot(0.5);
+    expect(snap.lapFraction).toBe(0.5);
+    expect(snap.safetyCarProgress).toBeNull();
+    expect(snap.cars).toHaveLength(engine.cars.length);
+    expect(new Set(snap.cars.map((c) => c.trackProgress.toFixed(4))).size).toBeGreaterThan(1);
+    const braking = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+      .flatMap((u) => engine.broadcastSnapshot(u).cars)
+      .some((c) => c.braking);
+    expect(braking).toBe(true);
+    expect(snap.cars.every((c) => c.trackProgress >= 0 && c.trackProgress <= 1)).toBe(true);
+    expect(snap.cars.every((c) => Number.isFinite(c.elevationMetres))).toBe(true);
+    expect(snap.cars.map((c) => c.position)).toEqual(snap.cars.map((_, i) => i + 1));
+  });
+
+  it("applies fuel and ERS commands to the broadcast and the next lap", () => {
+    const { bundle, teamId } = playerBundle();
+    const { engine, controlled } = makeEngine(bundle, teamId);
+    const me = controlled[0];
+    engine.setCommand(me, { fuelMode: "lean", ers: "high" });
+    const car = engine.snapshot().cars.find((c) => c.driverId === me);
+    expect(car?.fuelMode).toBe("lean");
+    expect(car?.ers).toBe("high");
+
+    const before = engine.snapshot().cars.find((c) => c.driverId === me)?.ersCharge ?? 0;
+    engine.step();
+    const after = engine.snapshot().cars.find((c) => c.driverId === me)?.ersCharge ?? 0;
+    expect(after).toBeLessThan(before);
+  });
+
   it("boxing fits the requested compound and records a pit stop", () => {
     const { bundle, teamId } = playerBundle();
     const { engine, controlled } = makeEngine(bundle, teamId);
@@ -166,6 +202,40 @@ describe("interactive live race", () => {
     }
     // Grid order is not simply the finishing order.
     expect(result.classification.some((c) => c.gridPosition !== c.position)).toBe(true);
+  });
+
+  it("hands a disconnected principal's cars to the AI and refuses human commands", () => {
+    const { bundle, teamId } = playerBundle();
+    const { engine, controlled } = makeEngine(bundle, teamId);
+    const driverId = controlled[0];
+    expect(engine.setCommand(driverId, { pace: "push" })?.kind).toBe("radio");
+    expect(engine.setControlMode(driverId, "ai")?.kind).toBe("radio");
+    expect(engine.snapshot().cars.find((c) => c.driverId === driverId)?.controlMode).toBe("ai");
+    expect(engine.setCommand(driverId, { pace: "conserve" })).toBeNull();
+    runToEnd(engine);
+    expect(engine.finalize().result.classification.find((c) => c.driverId === driverId)).toBeTruthy();
+  });
+
+  it("replays the command and handover audit to the same official result", () => {
+    const { bundle, teamId } = playerBundle();
+    const { engine, controlled } = makeEngine(bundle, teamId);
+    engine.setCommand(controlled[0], { pace: "push" });
+    engine.step();
+    engine.step();
+    engine.setControlMode(controlled[1], "ai");
+    engine.setCommand(controlled[0], { pitRequest: true, pitCompound: "hard" });
+    engine.step();
+    engine.setControlMode(controlled[1], "human");
+    runToEnd(engine);
+
+    const finished = engine.finalize();
+    const replayed = replayLiveRaceAudit(bundle, finished.audit);
+    const ordered = (result: typeof finished.result) =>
+      result.classification.map((c) => `${c.position}:${c.driverId}:${c.timeSeconds}:${c.bestLap}:${c.pits}`);
+
+    expect(replayed.result.classification).toHaveLength(finished.result.classification.length);
+    expect(ordered(replayed.result)).toEqual(ordered(finished.result));
+    expect(replayed.result.winnerDriverId).toBe(finished.result.winnerDriverId);
   });
 
   it("commits a live result into the career exactly once", () => {

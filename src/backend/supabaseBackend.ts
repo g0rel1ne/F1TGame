@@ -13,6 +13,7 @@
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Backend, CareerAction, CareerActionExtra, AuthUser, LiveTransport } from "./types";
+import type { LiveRaceAudit } from "../engine/liveRace";
 import { DEFAULT_LOBBY_SETTINGS, settingsFromLobby } from "./types";
 import type { ChatMessage, Lobby, LobbySettings, RaceResult } from "../engine/types";
 import type { CareerBundle } from "../engine/season";
@@ -218,10 +219,15 @@ export class SupabaseBackend implements Backend {
     return { bundle: res.bundle as CareerBundle, result: res.result as RaceResult };
   }
 
-  async commitRace(lobbyId: string, userId: string, result: RaceResult): Promise<{ bundle: CareerBundle; result: RaceResult }> {
-    // The host simulated the race locally; the server re-validates the result
-    // against the shared career before processing points and finances.
-    const res = await this.invoke("commit-live-race", { lobbyId, userId, result });
+  async commitRace(
+    lobbyId: string,
+    userId: string,
+    result: RaceResult,
+    audit?: LiveRaceAudit,
+  ): Promise<{ bundle: CareerBundle; result: RaceResult }> {
+    // The host simulated the race locally; the server replays the instruction
+    // audit and re-scores the official result before processing points.
+    const res = await this.invoke("commit-live-race", { lobbyId, userId, result, audit });
     return { bundle: res.bundle as CareerBundle, result: res.result as RaceResult };
   }
 

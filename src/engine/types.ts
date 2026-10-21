@@ -85,6 +85,8 @@ export interface Circuit {
   surfaceEvolution: number;
   /** 0..1, risk factor for incidents (street circuits higher). */
   danger: number;
+  /** Approximate elevation change around the lap, in metres. */
+  elevationMetres?: number;
   sectors: Sector[];
   /** Real circuit outline derived from open map data (normalised 0..1). */
   outline: TrackPoint[];

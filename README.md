@@ -1,476 +1,98 @@
 # F1 Team Principal Online
 
-A browser-based Formula 1 team-management and race-simulation career game.
-Everything in this guide is copy-paste friendly for Windows PowerShell.
+Build a team. Beat the grid. Run the whole paddock.
 
-There are two ways to play:
+F1 Team Principal Online is a browser-based Formula 1 management and race-simulation game. Create your own constructor, sign drivers, develop the car, manage the budget, and take your team from backmarker to world champion. Play solo or share one career with friends in a live multiplayer lobby.
 
-| Mode | What you need | Where data is saved |
-| --- | --- | --- |
-| **Solo (offline)** | Node.js only | Your browser (IndexedDB) |
-| **Multiplayer** | Node.js + a free Supabase project | Supabase (shared lobby) |
-
-You can start solo in about two minutes. Multiplayer takes about ten minutes the
-first time, then it is just `npm.cmd run dev`.
+**Play online:** <https://g0rel1ne.github.io/F1TGame/>
 
 ---
 
-## Part 1 - Run it solo (no account, no backend)
+## What you can do
 
-### Step 1. Install Node.js
+- **Create your team** - choose your name, colours, livery, engine supplier, headquarters and development philosophy.
+- **Run race weekends** - practice programmes, car setup, qualifying, tyre strategy, pit stops, weather, damage, incidents and classified results.
+- **Manage a real paddock** - driver contracts and transfers, staff, morale, sponsors, facilities, research projects and a full finance ledger.
+- **Watch races live** - top-down cars on every circuit, a camera that follows your team, radio commands, ERS and fuel modes, pit stops, safety cars and track-limit penalties.
+- **Build a legacy** - championship standings, prize money, season rollover, records and history.
+- **Play together** - every principal owns one team in the same shared career. The host runs the race; everyone can issue radio commands for their own drivers and vote on the replay speed.
 
-Install **Node.js 20 or newer** from <https://nodejs.org> (the LTS installer is
-fine). Then open PowerShell and check:
+## Race weekends
 
-```powershell
-node --version
-npm.cmd --version
-```
+Each round follows the real shape of a Formula 1 weekend:
 
-> **Windows note:** use `npm.cmd` and `npx.cmd` instead of `npm` / `npx`. If you
-> type plain `npm`, PowerShell may block `npm.ps1` with an execution-policy error.
-
-### Step 2. Install the project
-
-```powershell
-cd C:\Users\fspal\Documents\f1game
-npm.cmd install
-```
-
-### Step 3. Start the game
-
-```powershell
-npm.cmd run dev
-```
-
-You will see something like:
-
-```
-  VITE v5.4.21  ready in 300 ms
-
-  ➜  Local:   http://localhost:5173/
-  ➜  Network: http://192.168.1.20:5173/
-```
-
-Open **http://localhost:5173/** in your browser.
-
-### Step 4. In the game
-
-1. Click **Play offline**.
-2. Click **Create career**.
-3. Fill in the team wizard (name, colours, engine, philosophy) and create your team.
-4. You are now on the dashboard. Progress is saved automatically in this browser.
-
-That is solo mode. No Supabase, no accounts, no internet required after install.
-
-### Stopping and restarting
-
-- Stop the terminal with `Ctrl + C`.
-- Start again later with `npm.cmd run dev`.
-- Data stays in the same browser profile. Clearing site data deletes the career.
-- Offline solo careers are stored in one browser profile only. Two different
-  browsers (or a browser and an incognito window) cannot share one — use online
-  multiplayer for that.
-- Invitation codes work between **tabs of the same browser** (they share the
-  local database), but never across devices. "No lobby found with that
-  invitation code" in offline mode means the code was made in a different
-  browser or device.
-
----
-
-## Part 2 - Run it multiplayer (Supabase)
-
-Multiplayer needs one shared database so every player sees the same career.
-Supabase's free tier is enough.
-
-### Step 1. Create a Supabase project
-
-1. Go to <https://supabase.com> and sign in.
-2. Click **New project**.
-3. Pick an organisation, a name (for example `f1-game`), a strong database
-   password, and the region closest to you.
-4. Wait until the project finishes provisioning (about a minute).
-
-### Step 2. Copy your API credentials
-
-In the Supabase dashboard:
-
-1. Open **Project Settings** (gear icon) → **API**.
-2. Copy **Project URL** (looks like `https://abcdefghijklm.supabase.co`).
-3. Copy the **anon public** key.
-
-> Never use the `service_role` key in the frontend or in `.env.local`. The anon
-> key is the public one and is safe to ship. Row Level Security enforces access.
-
-### Step 3. Create `.env.local`
-
-In the project folder, create a file named `.env.local` (it is gitignored) with:
-
-```env
-VITE_SUPABASE_URL=https://YOUR-PROJECT-REF.supabase.co
-VITE_SUPABASE_ANON_KEY=YOUR-ANON-PUBLIC-KEY
-VITE_BASE_PATH=/
-```
-
-Replace the two placeholder values with what you copied. Keep `VITE_BASE_PATH=/`
-for local development.
-
-If you already ran the dev server, stop it (`Ctrl + C`) and start it again after
-saving this file. Vite only reads env files at startup.
-
-### Step 4. Install/link the Supabase CLI
-
-Run these from the project folder:
-
-```powershell
-npx.cmd supabase --version
-npx.cmd supabase login
-```
-
-`login` opens a browser window; approve it and return to the terminal.
-
-Find your **project ref** (the part before `.supabase.co` in your Project URL),
-then:
-
-```powershell
-npx.cmd supabase link --project-ref YOUR-PROJECT-REF
-```
-
-It asks for the database password you set in Step 1.
-
-> Docker is **not** required for `link`, `db push` or `functions deploy`.
-> It is only needed for running Supabase locally with `supabase start`.
-
-### Step 5. Create the database tables
-
-```powershell
-npx.cmd supabase db push
-```
-
-Confirm with `y` if asked. This applies
-`supabase/migrations/0001_init.sql`, which creates:
-
-- `profiles` - public username for each account
-- `lobbies`, `lobby_members` - lobbies, hosts, invite codes, readiness
-- `chat_messages` - lobby chat
-- `careers` - the shared career snapshot
-- Row Level Security policies, lobby join function, and Realtime publication
-
-**Alternative without the CLI:** open **SQL Editor** in the Supabase dashboard,
-paste the entire contents of `supabase/migrations/0001_init.sql`, and click
-**Run**. Then continue with Step 6.
-
-### Step 6. Deploy the game server functions
-
-These Edge Functions run the authoritative simulation and finance logic. First
-copy the shared engine into the functions bundle:
-
-```powershell
-npm.cmd run sync:engine
-```
-
-Then deploy all six functions:
-
-```powershell
-npx.cmd supabase functions deploy apply-action
-npx.cmd supabase functions deploy start-race
-npx.cmd supabase functions deploy set-ready
-npx.cmd supabase functions deploy negotiate
-npx.cmd supabase functions deploy transfer-host
-npx.cmd supabase functions deploy remove-member
-```
-
-Supabase automatically provides `SUPABASE_URL`, `SUPABASE_ANON_KEY` and
-`SUPABASE_SERVICE_ROLE_KEY` to deployed functions. You do not need to set them.
-
-Re-run `npm.cmd run sync:engine` and redeploy the functions every time
-`src/engine` or `src/data` changes, otherwise the server and browser will run
-different versions of the game.
-
-### Step 7. Make sign-in easy for testing
-
-Supabase may require email confirmation by default.
-
-In the dashboard go to **Authentication** → **Providers** → **Email** and either:
-
-- turn **Confirm email** off for quick testing, or
-- keep it on and click the confirmation link in each test account's email.
-
-Also set **Authentication** → **URL Configuration** → **Site URL** to
-`http://localhost:5173` while developing.
-
-### Step 8. Start and play
-
-```powershell
-npm.cmd run dev
-```
-
-Open <http://localhost:5173>. You now get the online sign-in screen instead of
-the offline button.
-
-**Host:**
-
-1. Sign up with email + password + username.
-2. Create a lobby (public or private).
-3. Copy the invite code or the `?join=CODE` link.
-4. Create your team.
-
-**Every other player:**
-
-1. Open the link, or sign up and enter the invite code on the home page.
-2. Create their own team in the same career.
-
-**Race weekend:**
-
-1. Everyone runs practice and sets up their car.
-2. **Every online member must press Ready** - including the host, and even in a
-   one-player online lobby.
-3. Only the **host** can start the race, advance the calendar, or begin a new
-   season.
-
-### Testing multiplayer on one PC
-
-Use two different browsers (for example Chrome and Edge), or one normal window
-and one incognito window. Two tabs in the same profile share the same login.
-
-### Playing with a friend on your Wi-Fi
-
-Start the dev server with the host flag:
-
-```powershell
-npm.cmd run dev -- --host
-```
-
-Vite prints a **Network** URL such as `http://192.168.1.20:5173/`. Your friend
-opens that address on the same Wi-Fi and uses the invite code. They still need
-internet access because the game data lives in Supabase.
-
-### Playing with a friend anywhere (recommended)
-
-Deploy the frontend to GitHub Pages (Part 3) and share that URL plus the invite
-code. Do not share your localhost address - it only works on your machine.
-
----
-
-## Part 3 - Put it online with GitHub Pages
-
-The repository already contains `.github/workflows/deploy.yml`.
-
-### Step 1. Push the project to GitHub
-
-If this folder is not a git repository yet:
-
-```powershell
-git init
-git add .
-git commit -m "F1 Team Principal Online"
-git branch -M main
-git remote add origin https://github.com/YOUR-USERNAME/YOUR-REPO.git
-git push -u origin main
-```
-
-### Step 2. Add your Supabase secrets
-
-In the GitHub repository: **Settings** → **Secrets and variables** → **Actions**
-→ **New repository secret**. Add:
-
-| Name | Value |
-| --- | --- |
-| `VITE_SUPABASE_URL` | your Project URL |
-| `VITE_SUPABASE_ANON_KEY` | your anon public key |
-
-### Step 3. Enable Pages
-
-**Settings** → **Pages** → **Build and deployment** → **Source**:
-**GitHub Actions**.
-
-### Step 4. Deploy
-
-Push to `main` again (or run the workflow manually from the **Actions** tab).
-The workflow installs, typechecks, tests, builds and publishes the site.
-
-Your game will be at:
-
-```
-https://YOUR-USERNAME.github.io/YOUR-REPO/
-```
-
-The workflow automatically uses `/<repo-name>/` as the base path. If you use a
-custom domain or a `username.github.io` root repository, add a repository
-**variable** named `VITE_BASE_PATH` with the value `/`.
-
-### Step 5. Allow the deployed URL in Supabase
-
-In **Authentication** → **URL Configuration**, add your Pages URL to **Site URL**
-and **Redirect URLs** (for example `https://YOUR-USERNAME.github.io/YOUR-REPO/`).
-
----
-
-## Part 4 - Everyday commands
-
-Run these from `C:\Users\fspal\Documents\f1game`.
-
-| Command | What it does |
-| --- | --- |
-| `npm.cmd run dev` | Start the game (solo or online, depending on `.env.local`) |
-| `npm.cmd run dev -- --host` | Same, but reachable by other devices on your Wi-Fi |
-| `npm.cmd run build` | Typecheck and build the static site into `dist/` |
-| `npm.cmd run preview` | Serve the production build locally |
-| `npm.cmd test` | Run the automated engine tests |
-| `npm.cmd run typecheck` | TypeScript checks only |
-| `npm.cmd run sync:engine` | Copy engine/data into Supabase Functions (run before deploying functions) |
-| `npx.cmd supabase db push` | Apply new database migrations |
-| `npx.cmd supabase functions deploy <name>` | Deploy one Edge Function |
-
-### Switching between solo and online
-
-- **Online:** keep `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` filled in
-  `.env.local`, then restart `npm.cmd run dev`.
-- **Solo offline:** comment out both values (or rename `.env.local`), then restart
-  `npm.cmd run dev`. The **Play offline** button returns.
-
-Solo careers in offline mode exist only in that browser. If you want a solo
-career saved online, use multiplayer mode and simply create a private lobby
-alone.
-
----
-
-## Part 5 - How the game works
-
-### Weekend flow
-
-1. **Practice** - run setup, long-run, qualifying-sim, tyre and reliability
-   programs to learn the ideal setup.
+1. **Practice** - run setup, long-run, qualifying-sim, tyre and reliability programmes.
 2. **Setup** - tune downforce and balance for the circuit.
-3. **Ready** - every online member confirms.
-4. **Race** - qualifying, strategy, pit stops, weather, tyre wear, damage,
-   incidents and a classified result. The replay can be scrubbed on the map.
-5. **Results** - points, prize money, sponsor bonuses, repair costs and
-   standings update. The host advances to the next round.
+3. **Qualifying** - set the grid.
+4. **Race** - choose your pace, fuel mixture, ERS deployment and pit strategy while weather, tyres and incidents change the race.
+5. **Results** - points, prize money, sponsor bonuses, repair costs and standings are applied before the calendar advances.
 
-### Live races
+Races can be simulated instantly or run live with everyone watching. Live races include a shareable session, host control, reconnect support, majority speed votes and a server-validated final result.
 
-"Go live" (host only, once everyone is ready) runs the race in real time
-instead of simulating it instantly.
+## Multiplayer
 
-- **One shared race.** The host's browser owns the simulation and streams a beat
-  to the lobby roughly once per lap. Guests render those beats, so every
-  principal sees the same positions, gaps, tyres and incidents - there is
-  nothing to de-sync. If the beats stop arriving, guests are told the race is
-  waiting for the host.
-- **Radio your own cars.** Any principal can change pace, tyre compound or box
-  their own two drivers at any moment. Commands for other teams are rejected by
-  the host, and the host re-validates every incoming command.
-- **Vote on the pace.** Everyone can vote for 1x, 2x or 4x, or vote to skip the
-  rest of the race. A vote only lands on a strict majority, so a two-principal
-  lobby has to agree; a principal racing on their own changes either instantly.
-- **Pausing** is the host's call, so nobody can stall the race for the others.
-- **Two track views.** The map defaults to *Cars*: top-down models painted in each
-  team's real livery, red-and-white kerbs, a pit lane with team pit boxes, and a
-  camera that follows your lead car (or the race leader if you field no cars) so
-  you can watch overtakes happen. The classic *Dots* view is still there as a
-  zoomed-out full-circuit overview - toggle it with the button on the map, and
-  your choice is remembered.
-- **Who owns the result.** Because the players drive the race live, the host's
-  client sends the finishing order. Everything that touches the career -
-  the race identity, qualifying and grid, which drivers and teams may appear,
-  the laps, and every championship point - is recomputed by the server in
-  `commit-live-race`, so a tampered client cannot award itself points or claim a
-  different circuit. That is the same trust boundary as a host-run simulation;
-  the server is the only writer.
+One player creates a lobby and a shared career. Everyone else joins with an invite code, creates their own team, and races in the same world.
 
-Offline, the same mechanism runs over a browser `BroadcastChannel`, so two tabs
-of the same browser watching the same lobby can race together.
+- One team per player.
+- The host controls race starts, pauses, calendar advancement and host transfer.
+- Every member marks themselves ready before a race.
+- The host streams the live race; guests see the same positions, gaps, tyres and events.
+- Official results are recomputed by the server, so a modified client cannot award itself points or money.
 
-The live path has an integration test that talks to a real project:
+Offline, the same live-race transport works between tabs in one browser, so you can try multiplayer without creating an account.
 
-```
-$env:E2E_SUPABASE="1"; npx.cmd vitest run tests/e2e.commitLive.test.ts
+## Technology
+
+- **Frontend:** React 18, TypeScript, Vite, Tailwind CSS
+- **Simulation:** deterministic TypeScript engine shared by the browser and Supabase Edge Functions
+- **Multiplayer:** Supabase Auth, Postgres, Realtime and Edge Functions
+- **Offline mode:** IndexedDB with no backend required
+- **Hosting:** GitHub Pages via GitHub Actions
+
+## Run it locally
+
+You need Node.js 20 or newer.
+
+```powershell
+npm.cmd install
+npm.cmd run dev
 ```
 
-It creates throwaway accounts and a lobby, so run it against a scratch project
-and tidy up afterwards.
+Open <http://localhost:5173/>, then choose **Play offline** to start a solo career immediately.
 
-### Career systems
+For multiplayer, copy `.env.example` to `.env.local`, add your Supabase project URL and anon public key, then restart the dev server. Database migrations live in `supabase/migrations/`, and the Edge Functions live in `supabase/functions/`.
 
-- Team identity, colours, livery, logo and engine supplier
-- Driver contracts, negotiation, morale and a three-driver limit
-- Research projects with quality rolls, failures and installation
-- Nine upgradable facilities
-- Staff market across ten roles
-- Salaries, prize money, sponsors, transaction ledger and emergency funding
-- Championship standings, calendar, statistics, history and season rollover
+## Useful commands
 
-### Driver transfer market
-
-Between race weekends the AI teams work the market on their own:
-
-- They release a driver and sign a stronger free agent when one is available.
-- They poach a contracted driver from a rival AI team, settling a fee between the
-  two teams.
-- They approach **your** drivers. An incoming offer shows the bidding team, the
-  transfer fee, the salary and the contract length; accept it (the fee lands in
-  your account and the driver leaves, so sign a replacement) or reject it. Open
-  offers appear on the **Drivers** page and are also reported in the news feed.
-
-### Multiplayer rules
-
-- One team per player per career.
-- The host owns calendar advancement, race starts, pause, host transfer and
-  member removal.
-- Every online member must be ready before the host can start a race.
-- A race can be simulated instantly ("Quick sim") or raced live by everyone;
-  either way the host submits it and `commit-live-race` re-scores it.
-- Career state is stored as one versioned JSON snapshot. Browsers can read it;
-  only Edge Functions can write it, so clients cannot fake results or money.
-- If two players act at the same instant, one gets a "career was updated"
-  message. Refresh and repeat the action.
-
----
-
-## Troubleshooting
-
-| Problem | Fix |
+| Command | Purpose |
 | --- | --- |
-| `npm.ps1 cannot be loaded` | Use `npm.cmd` / `npx.cmd`. |
-| `Port 5173 is already in use` | Stop the other dev server, or run `npm.cmd run dev -- --port 5174`. |
-| The app still shows **Play offline** after adding `.env.local` | Stop and restart `npm.cmd run dev`; env files are read at startup. |
-| Sign-up says "Email not confirmed" | Confirm the email, or disable **Confirm email** in Supabase Auth settings. |
-| `join_lobby_by_code` does not exist | The migration was not applied. Run `npx.cmd supabase db push` or run the SQL file in the SQL Editor. |
-| `Career not found for this lobby` | Create a fresh lobby after applying the migration. |
-| "X not ready" when starting | Every online member, including the host, must press Ready first. |
-| `Unauthorized` / `Invalid or expired session` | Sign out and back in; make sure the function was deployed with JWT verification (default). |
-| Edge Function returns `Missing environment variable` | Redeploy through the Supabase CLI; platform secrets are injected automatically. |
-| Engine changes do not affect online races | Run `npm.cmd run sync:engine` and redeploy the six functions. |
-| GitHub Pages shows a blank page | Set repository variable `VITE_BASE_PATH` to `/<repo-name>/` (or `/` for a root site). |
-| Refreshing a deep link gives 404 | The workflow copies `index.html` to `404.html`; make sure the latest workflow ran. |
-| Supabase project paused | Free projects pause after inactivity. Restore it from the dashboard. |
-| Build fails on `node:url` / `process` | Run `npm.cmd install`; `@types/node` and `tsconfig.node.json` types are required. |
-
----
-
-## Assumptions and legal notes
-
-- Circuit outlines trace the real track layouts, derived from the open-source
-  [f1-circuits](https://github.com/bacinger/f1-circuits) GeoJSON set (MIT
-  licence), then simplified and normalised for the map.
-- Cars use an original SVG design. No official logos, liveries, photographs or
-  fonts are included.
-- Real driver names are present in the data but disabled by default; the default
-  roster is fictional.
-- AI teams use real constructor names as competitors. This is an unofficial fan
-  project, not affiliated with Formula 1, the FIA or any team.
-- All money values are fictional and simplified for gameplay.
+| `npm.cmd run dev` | Start the development server |
+| `npm.cmd run build` | Typecheck and build the production site |
+| `npm.cmd run preview` | Preview the production build |
+| `npm.cmd test` | Run the simulation test suite |
+| `npm.cmd run typecheck` | Check TypeScript |
+| `npm.cmd run sync:engine` | Copy the shared engine into the Supabase Functions bundle |
+| `npx.cmd supabase db push` | Apply database migrations |
+| `npx.cmd supabase functions deploy <name>` | Deploy an Edge Function |
 
 ## Project layout
 
+```text
+src/engine/      deterministic simulation and live-race logic
+src/data/        teams, drivers, circuits, sponsors and staff
+src/backend/     offline IndexedDB backend and Supabase backend
+src/state/       session and shared-career state
+src/pages/       game screens
+src/components/  race views, maps, cars and UI
+supabase/        migrations and Edge Functions
+tests/           engine, live-race and protocol tests
+scripts/         engine sync tooling
 ```
-src/engine/      pure deterministic simulation (shared by browser and server)
-src/data/        teams, drivers, circuits, sponsors, staff
-src/backend/     offline IndexedDB backend + Supabase backend
-src/state/       session provider
-src/pages/       all screens
-supabase/        migration + six Edge Functions
-scripts/         sync-engine.mjs
-tests/           Vitest engine tests
-```
+
+## Notes
+
+This is an unofficial fan project and is not affiliated with Formula 1, the FIA or any team. Real driver data is included but disabled by default; the default grid is fictional. Car artwork is original SVG. Circuit outlines are derived from the open-source [f1-circuits](https://github.com/bacinger/f1-circuits) GeoJSON set under the MIT licence.
+
+---
+
+Made by **g0rel1ne**.
